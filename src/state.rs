@@ -952,8 +952,17 @@ impl PurpState {
         }
     }
 
-    /// Spawn `/home/mag/Documents/Spotlight` (`--toggle`) as the app launcher.
+    /// Toggle `/home/mag/Documents/Spotlight` as the app launcher.
+    /// Fast path: write `"Toggle"\n` directly to the daemon's Unix domain socket (`$XDG_RUNTIME_DIR/spotlight.sock`),
+    /// taking ~0.03ms with zero fork/exec overhead.
+    /// Fallback: if the socket connection fails (daemon not running), spawn the binary via [`LAUNCHER_COMMANDS`].
     pub fn spawn_launcher(&self) {
+        let sock_path = self.runtime_dir.join("spotlight.sock");
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock_path) {
+            if stream.write_all(b"\"Toggle\"\n").is_ok() && stream.flush().is_ok() {
+                return;
+            }
+        }
         self.spawn_first_available(LAUNCHER_COMMANDS, "Spotlight launcher");
     }
 
@@ -1224,6 +1233,7 @@ impl PurpState {
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .env("XDG_SESSION_TYPE", "wayland")
             .env("XDG_CURRENT_DESKTOP", "purpwm")
+            .env("WGPU_BACKEND", "gl")
             .env("QT_QPA_PLATFORM", "wayland")
             .env("GDK_BACKEND", "wayland")
             .env("MOZ_ENABLE_WAYLAND", "1")
@@ -1585,12 +1595,15 @@ impl CompositorHandler for PurpState {
         for layer in &mut self.layer_surfaces {
             if layer.surface.wl_surface() == surface {
                 is_layer = true;
+                let old_geo = layer.geo;
                 layer.compute_geometry(self.output_size);
-                let size = layer.geo.size;
-                layer.surface.with_pending_state(|pending| {
-                    pending.size = Some(size);
-                });
-                let _ = layer.surface.send_pending_configure();
+                if layer.geo != old_geo {
+                    let size = layer.geo.size;
+                    layer.surface.with_pending_state(|pending| {
+                        pending.size = Some(size);
+                    });
+                    let _ = layer.surface.send_pending_configure();
+                }
             }
         }
         if is_layer {

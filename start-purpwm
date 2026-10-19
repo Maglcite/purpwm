@@ -25,6 +25,9 @@ export GDK_BACKEND="wayland,x11"
 export MOZ_ENABLE_WAYLAND=1
 export ELECTRON_OZONE_PLATFORM_HINT=auto
 export _JAVA_AWT_WM_NONREPARENTING=1
+# Wayland compositors lacking linux-dmabuf (such as nested Gamescope / purpwm) fail Vulkan WSI
+# with VK_ERROR_SURFACE_LOST_KHR after a ~500ms timeout stall. Setting WGPU_BACKEND=gl eliminates this.
+export WGPU_BACKEND=gl
 
 # Ensure user's ~/.local/bin and cargo bin are in PATH
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:$PATH"
@@ -41,7 +44,7 @@ fi
 
 # Import environment into systemd user session
 if command -v systemctl >/dev/null 2>&1; then
-    systemctl --user import-environment XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DBUS_SESSION_BUS_ADDRESS SSH_AUTH_SOCK PATH 2>/dev/null || true
+    systemctl --user import-environment XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DBUS_SESSION_BUS_ADDRESS SSH_AUTH_SOCK PATH WGPU_BACKEND 2>/dev/null || true
 fi
 
 # Ensure Wi-Fi and Bluetooth are active on session login

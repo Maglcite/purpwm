@@ -184,4 +184,31 @@ mod tests {
         assert_eq!(parsed.summary, "Alert");
         assert_eq!(parsed.body, "Body text");
     }
+
+    #[test]
+    fn test_spotlight_socket_toggle_protocol() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let temp_dir = std::env::temp_dir().join(format!("purpwm-sock-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let sock_path = temp_dir.join("spotlight.sock");
+
+        let listener = UnixListener::bind(&sock_path).expect("bind test socket");
+
+        // Simulate purpwm fast-path send
+        let mut client = UnixStream::connect(&sock_path).expect("connect test socket");
+        assert!(client.write_all(b"\"Toggle\"\n").is_ok());
+        assert!(client.flush().is_ok());
+        drop(client);
+
+        let (server, _) = listener.accept().expect("accept connection");
+        let mut reader = BufReader::new(server);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read line");
+        assert_eq!(line.trim(), "\"Toggle\"");
+
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
 }
