@@ -263,6 +263,21 @@ pub const WINDOW_RULES: &[WindowRule] = &[
         is_floating: false,
         opacity: Some(1.0),
     },
+    // Games are always fully opaque (Sober = Roblox)
+    WindowRule {
+        app_id_match: Some("org.vinegarhq.Sober"),
+        title_match: None,
+        tags: 0,
+        is_floating: false,
+        opacity: Some(1.0),
+    },
+    WindowRule {
+        app_id_match: Some("steam_app_"),
+        title_match: None,
+        tags: 0,
+        is_floating: false,
+        opacity: Some(1.0),
+    },
 ];
 
 // ============================================================================

@@ -60,6 +60,14 @@ Window colours are `Color32F` (RGBA floats, `0.0..=1.0`); bar colours are `[u8; 
 | `BAR_TAG_ACTIVE_RGBA`, `BAR_LAYOUT_BG_RGBA` | Selected tag, pills |
 | `BAR_ACCENT_RGBA`, `BAR_TEXT_FG_RGBA`, `BAR_TEXT_DIM_RGBA` | Accent, normal and dimmed text |
 
+## Cursor
+
+The pointer uses your system XCursor theme: `XCURSOR_THEME` if set, otherwise the
+`default` theme (usually Adwaita), at `XCURSOR_SIZE` (default `24`) times the UI scale.
+Apps can still show their own shapes (text I-beam, link hand, resize arrows) through
+`wp_cursor_shape_v1` or their own cursor surfaces. If no theme is installed, purpwm falls
+back to its built-in purple arrow.
+
 ## Window rules
 
 `WINDOW_RULES` is checked once, as soon as a window sets its `app_id` or title. The first
@@ -83,7 +91,8 @@ each other. Find an app's
 
 Built-in rules float Spotlight, purpwm's own helper windows, polkit dialogs, file pickers,
 `pavucontrol`, `nm-connection-editor`, `blueman-manager` and COSMIC Settings, and make
-`mpv`, `imv` and `vlc` fully opaque.
+`mpv`, `imv`, `vlc`, Sober (Roblox) and Steam games fully opaque. Fullscreen windows are
+always fully opaque with a black backdrop, whatever the rules say.
 
 ## Commands
 

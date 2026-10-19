@@ -5,6 +5,7 @@
 
 pub mod bar;
 pub mod config;
+pub mod cursor;
 pub mod input;
 pub mod lock;
 pub mod notify;
@@ -36,6 +37,7 @@ use smithay::{
         },
         winit::{self, WinitEvent, WinitInput},
     },
+    input::pointer::CursorImageStatus,
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         wayland_server::{Display, ListeningSocket},
@@ -491,6 +493,9 @@ pub fn run_winit(
                 }
                 for (popup, _) in state.visible_popups() {
                     send_frames_surface_tree(popup.wl_surface(), elapsed_ms);
+                }
+                if let CursorImageStatus::Surface(ref cursor) = state.cursor_status {
+                    send_frames_surface_tree(cursor, elapsed_ms);
                 }
                 for layer in &state.layer_surfaces {
                     if layer.surface.alive() {

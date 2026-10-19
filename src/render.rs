@@ -10,13 +10,15 @@
 //! 7. Renders `wlr-layer-shell` surfaces: `Background`/`Bottom` under the windows, `Top`/`Overlay`
 //!    (such as `/home/mag/Documents/Spotlight`) on top
 //! 8. Renders active desktop notification toasts (`NotificationCenter`) in the top-right corner
-//! 9. Renders any active Wayland drag-and-drop icon (`state.dnd_icon`) and the software cursor
+//! 9. Renders any active Wayland drag-and-drop icon (`state.dnd_icon`) and the cursor
+//!    (client cursor surface, else the system XCursor theme, else a built-in purple arrow)
 
 use smithay::{
     backend::renderer::{
         element::{
             memory::MemoryRenderBufferRenderElement,
             solid::SolidColorRenderElement,
+            utils::CropRenderElement,
             surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
             Id, Kind,
         },
@@ -24,8 +26,9 @@ use smithay::{
         utils::{draw_render_elements, CommitCounter},
         Color32F, Frame, Renderer,
     },
-    input::pointer::CursorImageStatus,
+    input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
     utils::{IsAlive, Logical, Physical, Point, Rectangle, Size, Transform},
+    wayland::compositor::with_states,
 };
 
 use crate::{
@@ -36,8 +39,10 @@ use crate::{
     state::PurpState,
 };
 
+/// One window: opaque backdrop (fullscreen only), surfaces clipped to the window, border, glow.
 type WindowRenderBatch = (
-    Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    Option<SolidColorRenderElement>,
+    Vec<CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
     Option<[SolidColorRenderElement; 4]>,
     Option<[SolidColorRenderElement; 4]>,
 );
@@ -179,14 +184,24 @@ pub fn render_output_frame<'a>(
     for idx in ordered_indices {
         let w = &state.windows[idx];
         let is_focused = state.focused_idx == Some(idx);
-        let alpha = w.opacity_override.unwrap_or(if is_focused {
-            OPACITY_ACTIVE
+        // Fullscreen windows (games, video) are always fully opaque: nothing behind them
+        // may show through.
+        let alpha = if w.is_fullscreen {
+            1.0
         } else {
-            OPACITY_INACTIVE
-        });
+            w.opacity_override.unwrap_or(if is_focused {
+                OPACITY_ACTIVE
+            } else {
+                OPACITY_INACTIVE
+            })
+        };
         let loc_phys = w.surface_loc().to_physical_precise_round(scale);
 
-        let surf_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+        // Clip the client to its own window: an oversized or mispositioned buffer must not
+        // spill over other windows or the desktop.
+        let clip: Rectangle<i32, Physical> =
+            Rectangle::new(w.content_loc(), w.surface_size()).to_physical_precise_round(scale);
+        let surf_elems: Vec<CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>> =
             render_elements_from_surface_tree(
                 renderer,
                 w.wl_surface(),
@@ -194,7 +209,22 @@ pub fn render_output_frame<'a>(
                 scale,
                 alpha,
                 Kind::Unspecified,
-            );
+            )
+            .into_iter()
+            .filter_map(|elem| CropRenderElement::from_element(elem, scale, clip))
+            .collect();
+
+        // Black backdrop behind fullscreen windows, so transparent pixels a game leaves in its
+        // buffer show black instead of the desktop and other windows.
+        let backdrop = w.is_fullscreen.then(|| {
+            SolidColorRenderElement::new(
+                Id::new(),
+                clip,
+                CommitCounter::default(),
+                Color32F::new(0.0, 0.0, 0.0, 1.0),
+                Kind::Unspecified,
+            )
+        });
 
         let (borders, glow) = if !w.is_fullscreen && BORDER_WIDTH > 0 {
             let color = if is_focused {
@@ -215,7 +245,7 @@ pub fn render_output_frame<'a>(
             (None, None)
         };
 
-        window_batches.push((surf_elems, borders, glow));
+        window_batches.push((backdrop, surf_elems, borders, glow));
     }
 
     // 3. Popup menus of visible windows, drawn above all windows (front-to-back like all
@@ -299,17 +329,45 @@ pub fn render_output_frame<'a>(
         })
         .unwrap_or_default();
 
-    // 7. Always render our high-contrast purple/white pointer cursor on top unless explicitly
-    //    hidden (or a screenshot is being taken of this frame)
-    let cursor_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> =
-        if !matches!(state.cursor_status, CursorImageStatus::Hidden)
-            && state.screenshot_request.is_none()
-        {
-            let cpos = state.pointer_location.to_physical(scale);
-            state.bar.cursor_render_element(renderer, cpos)
-        } else {
-            None
-        };
+    // 7. Pointer cursor (not in screenshots): a client's own cursor surface, else the named
+    //    shape from the system cursor theme, else the built-in purple arrow.
+    let mut cursor_surface_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+    let mut cursor_theme_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> = None;
+    let mut cursor_fallback_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> = None;
+    if state.screenshot_request.is_none() {
+        match state.cursor_status.clone() {
+            CursorImageStatus::Hidden => {}
+            CursorImageStatus::Surface(surface) if surface.alive() => {
+                let hotspot = with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .get::<CursorImageSurfaceData>()
+                        .map(|data| data.lock().unwrap().hotspot)
+                        .unwrap_or_default()
+                });
+                let loc = (state.pointer_location - hotspot.to_f64()).to_physical_precise_round(scale);
+                cursor_surface_elems = render_elements_from_surface_tree(
+                    renderer,
+                    &surface,
+                    loc,
+                    scale,
+                    1.0,
+                    Kind::Cursor,
+                );
+            }
+            status => {
+                let icon = match status {
+                    CursorImageStatus::Named(icon) => icon,
+                    _ => CursorIcon::Default,
+                };
+                let cpos = state.pointer_location.to_physical(scale);
+                cursor_theme_elem = state.cursor_theme.render_element(renderer, icon, cpos, scale);
+                if cursor_theme_elem.is_none() {
+                    cursor_fallback_elem = state.bar.cursor_render_element(renderer, cpos);
+                }
+            }
+        }
+    }
 
     // 8. Begin OpenGL ES frame & draw
     let mut frame = renderer.render(framebuffer, physical_size, transform)?;
@@ -321,7 +379,15 @@ pub fn render_output_frame<'a>(
     draw_render_elements(&mut frame, scale, &below_layer_elems, &[damage])?;
 
     // Draw windows from back to front so alpha blending layers properly over the purple backdrop
-    for (surf_elems, maybe_borders, maybe_glow) in window_batches.iter().rev() {
+    for (maybe_backdrop, surf_elems, maybe_borders, maybe_glow) in window_batches.iter().rev() {
+        if let Some(backdrop) = maybe_backdrop {
+            draw_render_elements::<GlesRenderer, f64, SolidColorRenderElement>(
+                &mut frame,
+                1.0,
+                std::slice::from_ref(backdrop),
+                &[damage],
+            )?;
+        }
         draw_render_elements(&mut frame, scale, surf_elems, &[damage])?;
         if let Some(glow) = maybe_glow {
             draw_render_elements::<GlesRenderer, f64, SolidColorRenderElement>(
@@ -374,9 +440,14 @@ pub fn render_output_frame<'a>(
     // Draw drag-and-drop icon under the cursor
     draw_render_elements(&mut frame, scale, &dnd_elems, &[damage])?;
 
-    // Draw software cursor on top of all surfaces
-    if let Some(ref cur) = cursor_elem {
-        // The cursor bitmap is in logical pixels, so it grows with the scale too.
+    // Draw the cursor on top of all surfaces
+    draw_render_elements(&mut frame, scale, &cursor_surface_elems, &[damage])?;
+    if let Some(ref cur) = cursor_theme_elem {
+        // Theme cursors are sized in physical pixels already.
+        draw_render_elements(&mut frame, 1.0, std::slice::from_ref(cur), &[damage])?;
+    }
+    if let Some(ref cur) = cursor_fallback_elem {
+        // The built-in bitmap is in logical pixels, so it grows with the scale.
         draw_render_elements(&mut frame, scale, std::slice::from_ref(cur), &[damage])?;
     }
 

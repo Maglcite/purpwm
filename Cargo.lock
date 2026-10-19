@@ -1318,6 +1318,7 @@ dependencies = [
  "smithay",
  "tracing",
  "tracing-subscriber",
+ "xcursor",
 ]
 
 [[package]]

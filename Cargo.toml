@@ -23,6 +23,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 png = "0.17"
+xcursor = "0.3"
 
 [profile.release]
 opt-level = 3

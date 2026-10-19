@@ -18,7 +18,7 @@ use smithay::{
         input::{Keycode, TouchSlot},
         renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
-    delegate_compositor, delegate_data_control, delegate_data_device, delegate_fractional_scale,
+    delegate_compositor, delegate_cursor_shape, delegate_data_control, delegate_data_device, delegate_fractional_scale,
     delegate_idle_inhibit, delegate_layer_shell, delegate_output, delegate_primary_selection,
     delegate_seat, delegate_shm, delegate_single_pixel_buffer, delegate_viewporter,
     delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
@@ -53,6 +53,8 @@ use smithay::{
     },
     utils::{IsAlive, Logical, Point, Rectangle, Serial, Size, Transform, SERIAL_COUNTER},
     wayland::{
+        cursor_shape::CursorShapeManagerState,
+        tablet_manager::TabletSeatHandler,
         buffer::BufferHandler,
         compositor::{
             send_surface_state, with_states, with_surface_tree_downward, CompositorClientState,
@@ -94,6 +96,7 @@ use smithay::{
 };
 
 use crate::{
+    cursor::CursorTheme,
     bar::StatusBar,
     config::{
         AUTOSTART_COMMANDS, BAR_HEIGHT, BORDER_WIDTH, BLUETOOTH_COMMANDS, BRIGHTNESS_DOWN_COMMANDS,
@@ -247,6 +250,7 @@ pub struct PurpState {
     pub viewporter_state: ViewporterState,
     pub single_pixel_buffer_state: SinglePixelBufferState,
     pub fractional_scale_state: FractionalScaleManagerState,
+    pub cursor_shape_state: CursorShapeManagerState,
     pub output_manager_state: OutputManagerState,
 
     // Input seat & handles
@@ -258,6 +262,8 @@ pub struct PurpState {
     pub touch_locations: HashMap<TouchSlot, Point<f64, Logical>>,
     pub touch_grab_slot: Option<TouchSlot>,
     pub cursor_status: CursorImageStatus,
+    /// System XCursor theme used to draw the pointer.
+    pub cursor_theme: CursorTheme,
     pub dnd_icon: Option<WlSurface>,
     pub modifiers: ModifiersState,
 
@@ -344,6 +350,7 @@ impl PurpState {
         let viewporter_state = ViewporterState::new::<Self>(&display_handle);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&display_handle);
+        let cursor_shape_state = CursorShapeManagerState::new::<Self>(&display_handle);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
 
         let mut seat = seat_state.new_wl_seat(&display_handle, "seat-0");
@@ -384,6 +391,7 @@ impl PurpState {
             viewporter_state,
             single_pixel_buffer_state,
             fractional_scale_state,
+            cursor_shape_state,
             output_manager_state,
             seat,
             keyboard,
@@ -393,6 +401,7 @@ impl PurpState {
             touch_locations: HashMap::new(),
             touch_grab_slot: None,
             cursor_status: CursorImageStatus::default_named(),
+            cursor_theme: CursorTheme::load(),
             dnd_icon: None,
             modifiers: ModifiersState::default(),
             mod_tap_candidate: false,
@@ -1824,6 +1833,9 @@ impl ServerDndGrabHandler for PurpState {
 
 impl OutputHandler for PurpState {}
 
+/// Needed by `wp_cursor_shape_v1` (cursor shapes requested for tablet tools); no tablets here.
+impl TabletSeatHandler for PurpState {}
+
 impl FractionalScaleHandler for PurpState {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
         apply_preferred_scale(&surface, self.scale);
@@ -2080,6 +2092,7 @@ delegate_idle_inhibit!(PurpState);
 delegate_viewporter!(PurpState);
 delegate_single_pixel_buffer!(PurpState);
 delegate_fractional_scale!(PurpState);
+delegate_cursor_shape!(PurpState);
 delegate_output!(PurpState);
 delegate_xdg_shell!(PurpState);
 delegate_xdg_decoration!(PurpState);
