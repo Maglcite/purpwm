@@ -1,0 +1,68 @@
+# Troubleshooting
+
+## Logs
+
+purpwm logs through `tracing`. Set `RUST_LOG` for more detail:
+
+```bash
+RUST_LOG=debug ./target/release/purpwm --no-autostart 2> purpwm.log
+```
+
+When started from a display manager, output goes wherever the display manager sends
+session output (often the systemd journal: `journalctl -b --user` or `journalctl -b`).
+
+## Testing changes safely
+
+If you are running purpwm as your session, test new builds **nested** and with
+`--no-autostart`:
+
+```bash
+env -u PURPWM_STANDALONE ./target/release/purpwm --no-autostart
+```
+
+- `PURPWM_STANDALONE` is set inside a purpwm session; without unsetting it the nested copy
+  goes full-screen.
+- Without `--no-autostart` the nested copy would restart your launcher daemon on itself,
+  start a second polkit agent and toggle your radios.
+- Rebuilding `target/release/purpwm` while it is running is safe; the running session
+  keeps the old binary until you log in again.
+- `kill -USR1 <pid>` makes a specific instance save a screenshot, which is handy for
+  checking rendering without touching it.
+
+## Common problems
+
+**Everything is too small / too big**
+Use `Mod + Ctrl + =` / `Mod + Ctrl + -`; the value is saved in `~/.config/purpwm/scale`.
+Delete that file to go back to `DEFAULT_SCALE`.
+
+**An app is blurry**
+It supports neither fractional scaling nor `wl_surface` version 6, so it renders at 1x and
+gets upscaled. Check whether it has a native Wayland mode (e.g. Electron:
+`--ozone-platform=wayland`). XWayland is not supported.
+
+**No password dialog appears for admin actions**
+Check that `purpwm-polkit-agent` is running (`pgrep -fa purpwm-polkit-agent`). Run it by
+hand inside the session to see errors; it prints
+`purpwm Polkit Authentication Agent successfully registered.` on success. Only one agent
+can be registered per login session, so another desktop's agent can block it.
+
+**The launcher doesn't open**
+Tapping `Mod` runs the first available entry in `LAUNCHER_COMMANDS`. Make sure the
+path exists, or change it in `src/config.rs`.
+
+**Wi-Fi / Bluetooth pill says `N/A`**
+`nmcli` or `bluetoothctl` isn't installed, or NetworkManager / `bluetoothd` isn't running
+(`systemctl status NetworkManager bluetooth`).
+
+**Brightness keys do nothing**
+Install `brightnessctl`, or check that logind accepts
+`busctl call org.freedesktop.login1 /org/freedesktop/login1/session/auto org.freedesktop.login1.Session SetBrightness ssu backlight <device> <value>`
+(device names are in `/sys/class/backlight`).
+
+**Screenshots aren't on the clipboard after closing purpwm**
+The clipboard image is served by the compositor itself, so it lasts only while purpwm
+runs. The PNG file in `~/Pictures/Screenshots` stays.
+
+**The session won't start from the login screen**
+Standalone mode needs `gamescope`. Run `start-purpwm` from a TTY to see its errors, and
+check the paths at the top of `start-purpwm` and in `install-session.sh`.
