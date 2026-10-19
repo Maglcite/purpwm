@@ -1,13 +1,16 @@
 //! OpenGL ES (`GlesRenderer`) frame composition for `purpwm`:
-//! 1. Clears output with translucent deep purple backdrop (`COLOR_BG_ROOT`)
-//! 2. Renders visible windows with active (`0.94`), inactive (`0.84`), or custom per-window (`1.0`) opacity
-//! 3. Draws 2px glowing electric purple borders (`COLOR_BORDER_ACTIVE` + 1px outer `COLOR_BORDER_GLOW`)
-//! 4. Renders built-in translucent purple top status bar (`MemoryRenderBufferRenderElement`),
+//! 1. If the session is locked (`state.lock_screen`), renders only the full-screen purple PAM
+//!    lock screen so no window, bar, or notification is visible while locked
+//! 2. Otherwise clears output with translucent deep purple backdrop (`COLOR_BG_ROOT`)
+//! 3. Renders visible windows with active (`0.94`), inactive (`0.84`), or custom per-window (`1.0`) opacity
+//! 4. Draws 2px glowing electric purple borders (`COLOR_BORDER_ACTIVE` + 1px outer `COLOR_BORDER_GLOW`)
+//! 5. Renders built-in translucent purple top status bar (`MemoryRenderBufferRenderElement`),
 //!    hidden while the focused window is fullscreen
-//! 5. Renders popup menus above windows and the bar
-//! 6. Renders `wlr-layer-shell` surfaces: `Background`/`Bottom` under the windows, `Top`/`Overlay`
+//! 6. Renders popup menus above windows and the bar
+//! 7. Renders `wlr-layer-shell` surfaces: `Background`/`Bottom` under the windows, `Top`/`Overlay`
 //!    (such as `/home/mag/Documents/Spotlight`) on top
-//! 7. Always renders a crisp high-contrast purple/white pointer cursor at `state.pointer_location`
+//! 8. Renders active desktop notification toasts (`NotificationCenter`) in the top-right corner
+//! 9. Renders any active Wayland drag-and-drop icon (`state.dnd_icon`) and the software cursor
 
 use smithay::{
     backend::renderer::{
@@ -22,7 +25,7 @@ use smithay::{
         Color32F, Frame, Renderer,
     },
     input::pointer::CursorImageStatus,
-    utils::{Logical, Physical, Point, Rectangle, Size, Transform},
+    utils::{IsAlive, Logical, Physical, Point, Rectangle, Size, Transform},
 };
 
 use crate::{
@@ -32,6 +35,18 @@ use crate::{
     },
     state::PurpState,
 };
+
+type WindowRenderBatch = (
+    Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    Option<[SolidColorRenderElement; 4]>,
+    Option<[SolidColorRenderElement; 4]>,
+);
+
+type LayerRenderBatch = (
+    Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+    [SolidColorRenderElement; 4],
+    [SolidColorRenderElement; 4],
+);
 
 /// Build the 4 rectangular border strips (`Top`, `Bottom`, `Left`, `Right`) around the
 /// logical `geo`, `bw` logical pixels thick, converted to physical pixels at `scale`.
@@ -49,8 +64,7 @@ fn border_rects_for_window(
     let h = geo.size.h.max(bw * 2);
 
     let top = Rectangle::<i32, Physical>::new(Point::from((x, y)), Size::from((w, bw)));
-    let bottom =
-        Rectangle::<i32, Physical>::new(Point::from((x, y + h - bw)), Size::from((w, bw)));
+    let bottom = Rectangle::<i32, Physical>::new(Point::from((x, y + h - bw)), Size::from((w, bw)));
     let left =
         Rectangle::<i32, Physical>::new(Point::from((x, y + bw)), Size::from((bw, h - 2 * bw)));
     let right = Rectangle::<i32, Physical>::new(
@@ -92,6 +106,19 @@ pub fn render_output_frame<'a>(
     let damage = Rectangle::from_size(physical_size);
     let scale = state.scale;
 
+    // 0. If locked, draw only the full-screen purple PAM lock screen (never expose desktop contents).
+    if let Some(ref mut lock) = state.lock_screen {
+        let font = state.bar.font();
+        let lock_elem = lock.render_element(renderer, font, physical_size, scale);
+        let mut frame = renderer.render(framebuffer, physical_size, transform)?;
+        frame.clear(COLOR_BG_ROOT, &[damage])?;
+        if let Some(ref elem) = lock_elem {
+            draw_render_elements(&mut frame, 1.0, std::slice::from_ref(elem), &[damage])?;
+        }
+        let _ = frame.finish()?;
+        return Ok(());
+    }
+
     // 1. Prepare the status bar element
     let occupied_tags = state
         .windows
@@ -122,34 +149,32 @@ pub fn render_output_frame<'a>(
             }
         })
         .unwrap_or_else(|| {
-            String::from("purpwm — Tap Mod: Spotlight | Mod+Enter: Term | Mod+w: Wi-Fi | Mod+Shift+b: BT")
+            String::from(
+                "purpwm — Tap Mod: Spotlight | Mod+Enter: Term | Mod+w: Wi-Fi | Mod+Shift+b: BT",
+            )
         });
 
-    let bar_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> =
-        if state.bar_visible() {
-            state.bar.render_element(
-                renderer,
-                physical_size.w,
-                state.workspace.selected_tags,
-                occupied_tags,
-                focused_tags,
-                urgent_tags,
-                state.workspace.layout(),
-                &focused_title,
-            )
-        } else {
-            None
-        };
+    let bar_visible = state.bar_visible();
+    let bar_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> = if bar_visible {
+        state.bar.render_element(
+            renderer,
+            physical_size.w,
+            state.workspace.selected_tags,
+            occupied_tags,
+            focused_tags,
+            urgent_tags,
+            state.workspace.layout(),
+            &focused_title,
+        )
+    } else {
+        None
+    };
 
     // 2. Collect visible window surface elements & their 2px purple borders + 1px outer glow,
     //    topmost first (same order the pointer hit-testing uses).
     let ordered_indices = state.stacking_order();
 
-    let mut window_batches: Vec<(
-        Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
-        Option<[SolidColorRenderElement; 4]>,
-        Option<[SolidColorRenderElement; 4]>,
-    )> = Vec::with_capacity(ordered_indices.len());
+    let mut window_batches: Vec<WindowRenderBatch> = Vec::with_capacity(ordered_indices.len());
 
     for idx in ordered_indices {
         let w = &state.windows[idx];
@@ -213,11 +238,7 @@ pub fn render_output_frame<'a>(
     // 4. `wlr-layer-shell` surfaces: `Background`/`Bottom` (wallpapers) go under the windows,
     //    `Top`/`Overlay` (e.g. the `Spotlight` launcher) above them with a glowing border.
     let mut below_layer_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-    let mut layer_batches: Vec<(
-        Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
-        [SolidColorRenderElement; 4],
-        [SolidColorRenderElement; 4],
-    )> = Vec::with_capacity(state.layer_surfaces.len());
+    let mut layer_batches: Vec<LayerRenderBatch> = Vec::with_capacity(state.layer_surfaces.len());
 
     for layer in &state.layer_surfaces {
         if !layer.surface.alive() {
@@ -252,7 +273,33 @@ pub fn render_output_frame<'a>(
         }
     }
 
-    // 5. Always render our high-contrast purple/white pointer cursor on top unless explicitly
+    // 5. Notification toasts in the top-right corner
+    let notif_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> = {
+        let font = state.bar.font();
+        state
+            .notifications
+            .render_element(renderer, font, state.output_size.w, bar_visible, scale)
+    };
+
+    // 6. Drag-and-drop icon surface (if an active client DnD session provided one)
+    let dnd_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
+        .dnd_icon
+        .as_ref()
+        .filter(|s| s.alive())
+        .map(|icon| {
+            let loc_phys = state.pointer_location.to_physical_precise_round(scale);
+            render_elements_from_surface_tree(
+                renderer,
+                icon,
+                loc_phys,
+                scale,
+                0.92,
+                Kind::Unspecified,
+            )
+        })
+        .unwrap_or_default();
+
+    // 7. Always render our high-contrast purple/white pointer cursor on top unless explicitly
     //    hidden (or a screenshot is being taken of this frame)
     let cursor_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> =
         if !matches!(state.cursor_status, CursorImageStatus::Hidden)
@@ -264,7 +311,7 @@ pub fn render_output_frame<'a>(
             None
         };
 
-    // 6. Begin OpenGL ES frame & draw
+    // 8. Begin OpenGL ES frame & draw
     let mut frame = renderer.render(framebuffer, physical_size, transform)?;
 
     // Clear background with deep translucent purple
@@ -318,6 +365,14 @@ pub fn render_output_frame<'a>(
             &[damage],
         )?;
     }
+
+    // Draw desktop notification toasts
+    if let Some(ref notif) = notif_elem {
+        draw_render_elements(&mut frame, 1.0, std::slice::from_ref(notif), &[damage])?;
+    }
+
+    // Draw drag-and-drop icon under the cursor
+    draw_render_elements(&mut frame, scale, &dnd_elems, &[damage])?;
 
     // Draw software cursor on top of all surfaces
     if let Some(ref cur) = cursor_elem {

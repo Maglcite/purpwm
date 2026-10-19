@@ -346,7 +346,14 @@ pub const BLUETOOTH_COMMANDS: &[&[&str]] = &[
 
 /// Audio volume up commands (`XF86AudioRaiseVolume`).
 pub const VOL_UP_COMMANDS: &[&[&str]] = &[
-    &["wpctl", "set-volume", "-l", "1.5", "@DEFAULT_AUDIO_SINK@", "5%+"],
+    &[
+        "wpctl",
+        "set-volume",
+        "-l",
+        "1.5",
+        "@DEFAULT_AUDIO_SINK@",
+        "5%+",
+    ],
     &["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+5%"],
 ];
 
@@ -398,7 +405,4 @@ pub const POLKIT_COMMANDS: &[&[&str]] = &[
 ];
 
 /// Optional background daemons to autostart when `purpwm` launches (notification daemons, wallpaper, etc.).
-pub const AUTOSTART_COMMANDS: &[&[&str]] = &[
-    &["mako"],
-    &["dunst"],
-];
+pub const AUTOSTART_COMMANDS: &[&[&str]] = &[&["mako"], &["dunst"]];

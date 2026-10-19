@@ -189,7 +189,8 @@ impl ManagedWindow {
     /// Send an `xdg_toplevel.configure` event matching the window's assigned geometry and focus.
     pub fn configure(&self, is_focused: bool, tiled_layout: bool) {
         let size = self.surface_size();
-        let is_tiled = !self.is_floating && !self.is_fullscreen && !self.is_scratchpad && tiled_layout;
+        let is_tiled =
+            !self.is_floating && !self.is_fullscreen && !self.is_scratchpad && tiled_layout;
 
         self.toplevel.with_pending_state(|state| {
             state.size = Some(size);

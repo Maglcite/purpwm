@@ -1,9 +1,11 @@
 //! Core compositor state (`PurpState`), Wayland protocol trait implementations,
 //! window focus/stack management, `wlr-layer-shell` overlay support (for `Spotlight`),
-//! `xdg-decoration` (server-side decorations), `primary-selection`, `viewporter`,
-//! `single-pixel-buffer`, `fractional-scale`, `xdg-activation`, scratchpad, and command spawning.
+//! `xdg-decoration` (server-side decorations), `primary-selection`, `wlr-data-control`,
+//! `idle-inhibit`, `viewporter`, `single-pixel-buffer`, `fractional-scale`, `xdg-activation`,
+//! native touch (`wl_touch`), built-in lock screen, notifications, scratchpad, and command spawning.
 
 use std::{
+    collections::HashMap,
     io::Write,
     os::unix::{io::OwnedFd, process::CommandExt},
     path::PathBuf,
@@ -13,13 +15,13 @@ use std::{
 
 use smithay::{
     backend::{
-        input::Keycode,
+        input::{Keycode, TouchSlot},
         renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
-    delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_layer_shell,
-    delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
-    delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_activation,
-    delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_compositor, delegate_data_control, delegate_data_device, delegate_fractional_scale,
+    delegate_idle_inhibit, delegate_layer_shell, delegate_output, delegate_primary_selection,
+    delegate_seat, delegate_shm, delegate_single_pixel_buffer, delegate_viewporter,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         find_popup_root_surface, get_popup_toplevel_coords, utils::under_from_surface_tree,
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy,
@@ -27,7 +29,8 @@ use smithay::{
     },
     input::{
         keyboard::{KeyboardHandle, ModifiersState},
-        pointer::{CursorImageStatus, Focus, PointerHandle},
+        pointer::{CursorImageStatus, Focus, MotionEvent, PointerHandle},
+        touch::TouchHandle,
         Seat, SeatHandler, SeatState,
     },
     reexports::{
@@ -39,6 +42,7 @@ use smithay::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::{
                 wl_buffer,
+                wl_data_source::WlDataSource,
                 wl_output::WlOutput,
                 wl_seat,
                 wl_surface::{self, WlSurface},
@@ -56,6 +60,7 @@ use smithay::{
         fractional_scale::{
             with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState,
         },
+        idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
         output::{OutputHandler, OutputManagerState},
         selection::{
             data_device::{
@@ -65,6 +70,7 @@ use smithay::{
             primary_selection::{
                 set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
             },
+            wlr_data_control::{DataControlHandler, DataControlState},
             SelectionHandler, SelectionTarget,
         },
         shell::{
@@ -89,16 +95,20 @@ use smithay::{
 use crate::{
     bar::StatusBar,
     config::{
-        AUTOSTART_COMMANDS, BAR_HEIGHT, DEFAULT_SCALE, SCALE_MAX, SCALE_MIN, SCALE_STEP, BLUETOOTH_COMMANDS, BRIGHTNESS_DOWN_COMMANDS,
-        BRIGHTNESS_UP_COMMANDS, LAUNCHER_COMMANDS, MEDIA_NEXT_COMMANDS, MEDIA_PLAY_COMMANDS,
-        MEDIA_PREV_COMMANDS, MIC_MUTE_COMMANDS, MIXER_COMMANDS, MOVE_STEP, POLKIT_COMMANDS,
-        RESIZE_STEP, SCREENSHOT_DIR, SYSTEM_MONITOR_COMMANDS, TAGMASK, TERMINAL_COMMANDS,
-        VOL_DOWN_COMMANDS, VOL_MUTE_COMMANDS, VOL_UP_COMMANDS, WIFI_COMMANDS, WINDOW_RULES,
+        AUTOSTART_COMMANDS, BAR_HEIGHT, BLUETOOTH_COMMANDS, BRIGHTNESS_DOWN_COMMANDS,
+        BRIGHTNESS_UP_COMMANDS, DEFAULT_SCALE, LAUNCHER_COMMANDS, MEDIA_NEXT_COMMANDS,
+        MEDIA_PLAY_COMMANDS, MEDIA_PREV_COMMANDS, MIC_MUTE_COMMANDS, MIXER_COMMANDS, MOVE_STEP,
+        POLKIT_COMMANDS, RESIZE_STEP, SCALE_MAX, SCALE_MIN, SCALE_STEP, SCREENSHOT_DIR,
+        SYSTEM_MONITOR_COMMANDS, TAGMASK, TERMINAL_COMMANDS, VOL_DOWN_COMMANDS, VOL_MUTE_COMMANDS,
+        VOL_UP_COMMANDS, WIFI_COMMANDS, WINDOW_RULES,
     },
+    lock::{LockPoll, LockScreen},
+    notify::NotificationCenter,
     wm::{LayoutMode, ManagedWindow, Workspace},
 };
 
-/// Active mouse drag operation (`Mod + Left-Drag` to move, `Mod + Right-Drag` to resize).
+/// Active mouse or touch drag operation (`Mod + Left-Drag` / `Mod + Touch-Drag` to move,
+/// `Mod + Right-Drag` to resize, or client-initiated `xdg_toplevel.move`/`resize`).
 /// Tracks the window by surface because window indices shift when windows map or unmap.
 #[derive(Debug, Clone)]
 pub enum InteractiveGrab {
@@ -133,7 +143,10 @@ pub struct ManagedLayerSurface {
 impl ManagedLayerSurface {
     pub fn compute_geometry(&mut self, output_size: Size<i32, Logical>) {
         let state = with_states(self.surface.wl_surface(), |states| {
-            *states.cached_state.get::<LayerSurfaceCachedState>().current()
+            *states
+                .cached_state
+                .get::<LayerSurfaceCachedState>()
+                .current()
         });
 
         // A zero size means "stretch between the anchored edges" (panels, wallpapers);
@@ -226,6 +239,9 @@ pub struct PurpState {
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    pub data_control_state: DataControlState,
+    pub idle_inhibit_state: IdleInhibitManagerState,
+    pub idle_inhibitors: Vec<WlSurface>,
     pub viewporter_state: ViewporterState,
     pub single_pixel_buffer_state: SinglePixelBufferState,
     pub fractional_scale_state: FractionalScaleManagerState,
@@ -235,8 +251,12 @@ pub struct PurpState {
     pub seat: Seat<Self>,
     pub keyboard: KeyboardHandle<Self>,
     pub pointer: PointerHandle<Self>,
+    pub touch: TouchHandle<Self>,
     pub pointer_location: Point<f64, Logical>,
+    pub touch_locations: HashMap<TouchSlot, Point<f64, Logical>>,
+    pub touch_grab_slot: Option<TouchSlot>,
     pub cursor_status: CursorImageStatus,
+    pub dnd_icon: Option<WlSurface>,
     pub modifiers: ModifiersState,
 
     /// Solo-Mod tap detection: set `true` when `Mod` is pressed alone, cleared if any
@@ -270,8 +290,28 @@ pub struct PurpState {
     /// Output scale (logical -> physical pixels); see `config::DEFAULT_SCALE`.
     pub scale: f64,
 
-    // Built-in status bar
+    // Built-in status bar, lock screen & notification center
     pub bar: StatusBar,
+    pub lock_screen: Option<LockScreen>,
+    pub notifications: NotificationCenter,
+}
+
+/// Convert physical window touch coordinates `(phys_x, phys_y)` into logical output coordinates
+/// at `scale`, clamped to `output_size`. Uses raw physical coordinates directly rather than
+/// Smithay's `WinitTouchStartedEvent::y_transformed`, which divides Y by width instead of height.
+pub fn touch_physical_to_logical_coords(
+    phys_x: f64,
+    phys_y: f64,
+    scale: f64,
+    output_size: Size<i32, Logical>,
+) -> Point<f64, Logical> {
+    let s = scale.max(0.1);
+    let max_x = (output_size.w - 1).max(0) as f64;
+    let max_y = (output_size.h - 1).max(0) as f64;
+    Point::from((
+        (phys_x / s).clamp(0.0, max_x),
+        (phys_y / s).clamp(0.0, max_y),
+    ))
 }
 
 impl PurpState {
@@ -290,6 +330,12 @@ impl PurpState {
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
+        let data_control_state = DataControlState::new::<Self, _>(
+            &display_handle,
+            Some(&primary_selection_state),
+            |_| true,
+        );
+        let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(&display_handle);
         let viewporter_state = ViewporterState::new::<Self>(&display_handle);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(&display_handle);
@@ -300,8 +346,10 @@ impl PurpState {
             .add_keyboard(Default::default(), 200, 25)
             .expect("Failed to initialize Wayland seat keyboard");
         let pointer = seat.add_pointer();
+        let touch = seat.add_touch();
 
         let bar = StatusBar::new(output_size.w);
+        let notifications = NotificationCenter::new();
 
         let uid = unsafe { libc::getuid() };
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
@@ -325,6 +373,9 @@ impl PurpState {
             seat_state,
             data_device_state,
             primary_selection_state,
+            data_control_state,
+            idle_inhibit_state,
+            idle_inhibitors: Vec::new(),
             viewporter_state,
             single_pixel_buffer_state,
             fractional_scale_state,
@@ -332,8 +383,12 @@ impl PurpState {
             seat,
             keyboard,
             pointer,
+            touch,
             pointer_location: Point::from((output_size.w as f64 / 2.0, output_size.h as f64 / 2.0)),
+            touch_locations: HashMap::new(),
+            touch_grab_slot: None,
             cursor_status: CursorImageStatus::default_named(),
+            dnd_icon: None,
             modifiers: ModifiersState::default(),
             mod_tap_candidate: false,
             intercepted_keys: Vec::new(),
@@ -352,7 +407,79 @@ impl PurpState {
             screenshot_rx,
             scale: 1.0,
             bar,
+            lock_screen: None,
+            notifications,
         }
+    }
+
+    /// Convert physical touch coordinates `(phys_x, phys_y)` into logical output coordinates.
+    pub fn touch_physical_to_logical(&self, phys_x: f64, phys_y: f64) -> Point<f64, Logical> {
+        touch_physical_to_logical_coords(phys_x, phys_y, self.scale, self.output_size)
+    }
+
+    /// Whether the built-in PAM screen locker is currently active.
+    pub fn is_locked(&self) -> bool {
+        self.lock_screen.is_some()
+    }
+
+    /// Engage the built-in purple lock screen (`Mod + Shift + l`, `Mod + Ctrl + l`, `XF86ScreenSaver`, or `SIGUSR2`).
+    pub fn lock_session(&mut self) {
+        if self.lock_screen.is_some() {
+            return;
+        }
+        self.active_grab = None;
+        self.touch_grab_slot = None;
+        self.touch_locations.clear();
+        self.mod_tap_candidate = false;
+
+        let touch = self.touch.clone();
+        touch.cancel(self);
+
+        let keyboard = self.keyboard.clone();
+        keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+
+        let pointer = self.pointer.clone();
+        pointer.motion(
+            self,
+            None,
+            &MotionEvent {
+                location: self.pointer_location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: 0,
+            },
+        );
+        pointer.frame(self);
+
+        self.lock_screen = Some(LockScreen::new());
+    }
+
+    /// Poll the lock screen's background PAM worker thread.
+    /// Returns `true` if the lock screen state changed (unlocked or failed attempt) and needs a redraw.
+    pub fn poll_lock_screen(&mut self) -> bool {
+        let Some(ref mut lock) = self.lock_screen else {
+            return false;
+        };
+        match lock.poll_result() {
+            LockPoll::Unlocked => {
+                self.lock_screen = None;
+                self.sync_keyboard_focus();
+                true
+            }
+            LockPoll::Failed => true,
+            LockPoll::Pending => false,
+        }
+    }
+
+    /// Whether any visible client surface has requested `zwp_idle_inhibit_manager_v1`.
+    pub fn is_idle_inhibited(&self) -> bool {
+        let tags = self.workspace.selected_tags;
+        self.idle_inhibitors.iter().any(|surf| {
+            surf.alive()
+                && self
+                    .windows
+                    .iter()
+                    .any(|w| w.wl_surface() == surf && w.is_visible_on(tags))
+        })
     }
 
     /// Re-run the `dwm` tiling engine, apply `WINDOW_RULES`, update layer surface geometries,
@@ -362,6 +489,10 @@ impl PurpState {
         self.windows.retain(|w| w.toplevel.alive());
         self.popup_manager.cleanup();
         self.layer_surfaces.retain(|l| l.surface.alive());
+        self.idle_inhibitors.retain(|s| s.alive());
+        if self.dnd_icon.as_ref().is_some_and(|s| !s.alive()) {
+            self.dnd_icon = None;
+        }
         if self.layer_focus.as_ref().is_some_and(|s| !s.alive()) {
             self.layer_focus = None;
         }
@@ -444,6 +575,12 @@ impl PurpState {
     }
 
     pub fn sync_keyboard_focus(&mut self) {
+        if self.is_locked() {
+            let keyboard = self.keyboard.clone();
+            keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+            return;
+        }
+
         let layer_target = self
             .layer_surfaces
             .iter()
@@ -466,7 +603,8 @@ impl PurpState {
     /// Change the output scale by `delta` (`Mod + Ctrl + =` / `Mod + Ctrl + -`) and remember it.
     /// The main loop picks up the new scale, updates the `wl_output` and relayouts.
     pub fn adjust_scale(&mut self, delta: f64) {
-        let next = (((self.scale + delta) / SCALE_STEP).round() * SCALE_STEP).clamp(SCALE_MIN, SCALE_MAX);
+        let next =
+            (((self.scale + delta) / SCALE_STEP).round() * SCALE_STEP).clamp(SCALE_MIN, SCALE_MAX);
         if (next - self.scale).abs() < f64::EPSILON {
             return;
         }
@@ -484,11 +622,20 @@ impl PurpState {
     pub fn set_scale(&mut self, scale: f64) {
         self.scale = scale;
         self.bar.set_scale(scale);
-        let mut roots: Vec<WlSurface> = self.windows.iter().map(|w| w.wl_surface().clone()).collect();
-        roots.extend(self.layer_surfaces.iter().map(|l| l.surface.wl_surface().clone()));
+        let mut roots: Vec<WlSurface> = self
+            .windows
+            .iter()
+            .map(|w| w.wl_surface().clone())
+            .collect();
+        roots.extend(
+            self.layer_surfaces
+                .iter()
+                .map(|l| l.surface.wl_surface().clone()),
+        );
         for w in &self.windows {
             roots.extend(
-                PopupManager::popups_for_surface(w.wl_surface()).map(|(p, _)| p.wl_surface().clone()),
+                PopupManager::popups_for_surface(w.wl_surface())
+                    .map(|(p, _)| p.wl_surface().clone()),
             );
         }
         for root in roots {
@@ -526,8 +673,8 @@ impl PurpState {
             order.push(f);
         }
         for pass_floating in [true, false] {
-            if let Some(f) =
-                focused.filter(|&i| !order.contains(&i) && floats(&self.windows[i]) == pass_floating)
+            if let Some(f) = focused
+                .filter(|&i| !order.contains(&i) && floats(&self.windows[i]) == pass_floating)
             {
                 order.push(f);
             }
@@ -857,7 +1004,9 @@ impl PurpState {
             }
 
             // 2. Ensure Bluetooth is unblocked and powered on
-            let _ = Command::new("rfkill").args(["unblock", "bluetooth"]).status();
+            let _ = Command::new("rfkill")
+                .args(["unblock", "bluetooth"])
+                .status();
             let _ = Command::new("bluetoothctl").args(["power", "on"]).status();
         });
         self.bar.request_immediate_status_refresh();
@@ -874,7 +1023,9 @@ impl PurpState {
             if let Ok(out) = Command::new("nmcli").args(["radio", "wifi"]).output() {
                 let s = String::from_utf8_lossy(&out.stdout);
                 if s.trim().eq_ignore_ascii_case("enabled") {
-                    let _ = Command::new("nmcli").args(["radio", "wifi", "off"]).status();
+                    let _ = Command::new("nmcli")
+                        .args(["radio", "wifi", "off"])
+                        .status();
                 } else {
                     let _ = Command::new("nmcli").args(["radio", "wifi", "on"]).status();
                     std::thread::sleep(std::time::Duration::from_millis(800));
@@ -901,24 +1052,26 @@ impl PurpState {
                     .lines()
                     .any(|l| l.trim().eq_ignore_ascii_case("Powered: yes"));
                 if is_on {
-                    let _ = Command::new("bluetoothctl")
-                        .args(["power", "off"])
-                        .status();
+                    let _ = Command::new("bluetoothctl").args(["power", "off"]).status();
                 } else {
-                    let _ = Command::new("rfkill").args(["unblock", "bluetooth"]).status();
-                    let _ = Command::new("bluetoothctl")
-                        .args(["power", "on"])
+                    let _ = Command::new("rfkill")
+                        .args(["unblock", "bluetooth"])
                         .status();
+                    let _ = Command::new("bluetoothctl").args(["power", "on"]).status();
                 }
             }
         });
         self.bar.request_immediate_status_refresh();
     }
 
-    /// Spawn the first available terminal emulator from [`TERMINAL_COMMANDS`].
     /// Spawn the polkit authentication agent (`purpwm-polkit-agent`).
     pub fn spawn_polkit_agent(&self) {
         self.spawn_first_available(POLKIT_COMMANDS, "polkit agent");
+    }
+
+    /// Start the built-in D-Bus notification daemon (`org.freedesktop.Notifications`).
+    pub fn spawn_notification_daemon(&self) {
+        self.notifications.start_dbus_listener(&self.runtime_dir);
     }
 
     /// Open the System Monitor / Task Manager (`Mod + Escape` or Left-Click on `CPU:` / `MEM:` / `BAT:` status bar pill).
@@ -987,6 +1140,9 @@ impl PurpState {
     /// Capture the whole screen (`Print`) or just the focused window (`Shift/Mod + Print`)
     /// on the next rendered frame. No `wlr-screencopy` / `grim` needed.
     pub fn request_screenshot(&mut self, focused_window_only: bool) {
+        if self.is_locked() {
+            return;
+        }
         let window_geo = self
             .focused_idx
             .and_then(|idx| self.windows.get(idx))
@@ -1152,10 +1308,13 @@ impl PurpState {
         })
     }
 
-    /// Exact surface under `point` for pointer focus: overlays, then popup menus, then the
+    /// Exact surface under `point` for pointer/touch focus: overlays, then popup menus, then the
     /// window's surface tree (subsurfaces respected), falling back to the toplevel itself
     /// when the pointer is over its border.
-    pub fn surface_under(&self, point: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+    pub fn surface_under(
+        &self,
+        point: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
         if let Some((surf, loc)) = self.layer_surface_at(point) {
             return Some((surf, loc.to_f64()));
         }
@@ -1172,6 +1331,51 @@ impl PurpState {
                 .map(|(surf, loc)| (surf, loc.to_f64()))
                 .unwrap_or_else(|| (root.clone(), surface_loc.to_f64()))
         })
+    }
+
+    /// Start a client-initiated interactive window move or resize (`xdg_toplevel.move` / `resize`).
+    fn begin_client_interactive_grab(&mut self, surface: &ToplevelSurface, is_move: bool) {
+        if self.is_locked() {
+            return;
+        }
+        let Some(idx) = self.windows.iter().position(|w| &w.toplevel == surface) else {
+            return;
+        };
+        if !self.windows[idx].is_visible_on(self.workspace.selected_tags) {
+            return;
+        }
+        self.focused_idx = Some(idx);
+        let active_touch = self
+            .touch_locations
+            .iter()
+            .next()
+            .map(|(&slot, &pos)| (slot, pos));
+        let start_pointer = active_touch
+            .map(|(_, pos)| pos)
+            .unwrap_or(self.pointer_location);
+        self.touch_grab_slot = active_touch.map(|(slot, _)| slot);
+
+        let w = &mut self.windows[idx];
+        if !w.is_floating && !w.is_scratchpad {
+            w.is_floating = true;
+            w.float_geo = w.geo;
+        }
+        let start_geo = w.float_geo;
+        let wl_surface = w.wl_surface().clone();
+        self.active_grab = Some(if is_move {
+            InteractiveGrab::Move {
+                surface: wl_surface,
+                start_pointer,
+                start_geo,
+            }
+        } else {
+            InteractiveGrab::Resize {
+                surface: wl_surface,
+                start_pointer,
+                start_geo,
+            }
+        });
+        self.relayout();
     }
 
     /// Clamp a new or repositioned popup to the visible output area below the status bar.
@@ -1192,7 +1396,11 @@ impl PurpState {
             return;
         };
 
-        let top = if self.workspace.show_bar { BAR_HEIGHT } else { 0 };
+        let top = if self.workspace.show_bar {
+            BAR_HEIGHT
+        } else {
+            0
+        };
         let mut target = Rectangle::new(
             Point::from((0, top)),
             Size::from((self.output_size.w, self.output_size.h - top)),
@@ -1258,7 +1466,12 @@ fn adjust_backlight_via_logind(percent_delta: i32) {
             return;
         };
         let step = (max * percent_delta.abs() as i64 / 100).max(1);
-        let next = (if percent_delta >= 0 { cur + step } else { cur - step }).clamp(max / 100, max);
+        let next = (if percent_delta >= 0 {
+            cur + step
+        } else {
+            cur - step
+        })
+        .clamp(max / 100, max);
         let name = device.file_name().to_string_lossy().into_owned();
         let _ = Command::new("busctl")
             .args([
@@ -1445,7 +1658,39 @@ impl PrimarySelectionHandler for PurpState {
     }
 }
 
-impl ClientDndGrabHandler for PurpState {}
+impl DataControlHandler for PurpState {
+    fn data_control_state(&self) -> &DataControlState {
+        &self.data_control_state
+    }
+}
+
+impl IdleInhibitHandler for PurpState {
+    fn inhibit(&mut self, surface: WlSurface) {
+        if !self.idle_inhibitors.contains(&surface) {
+            self.idle_inhibitors.push(surface);
+        }
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        self.idle_inhibitors.retain(|s| s != &surface);
+    }
+}
+
+impl ClientDndGrabHandler for PurpState {
+    fn started(
+        &mut self,
+        _source: Option<WlDataSource>,
+        icon: Option<WlSurface>,
+        _seat: Seat<Self>,
+    ) {
+        self.dnd_icon = icon;
+    }
+
+    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+        self.dnd_icon = None;
+    }
+}
+
 impl ServerDndGrabHandler for PurpState {
     fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<Self>) {}
 }
@@ -1518,7 +1763,10 @@ impl WlrLayerShellHandler for PurpState {
         namespace: String,
     ) {
         let state = with_states(surface.wl_surface(), |states| {
-            *states.cached_state.get::<LayerSurfaceCachedState>().current()
+            *states
+                .cached_state
+                .get::<LayerSurfaceCachedState>()
+                .current()
         });
         let w = if state.size.w > 0 { state.size.w } else { 740 };
         let h = if state.size.h > 0 { state.size.h } else { 620 };
@@ -1650,6 +1898,20 @@ impl XdgShellHandler for PurpState {
         surface.send_repositioned(token);
     }
 
+    fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
+        self.begin_client_interactive_grab(&surface, true);
+    }
+
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: wl_seat::WlSeat,
+        _serial: Serial,
+        _edges: xdg_toplevel::ResizeEdge,
+    ) {
+        self.begin_client_interactive_grab(&surface, false);
+    }
+
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
         if let Some(w) = self.windows.iter_mut().find(|w| w.toplevel == surface) {
             w.is_fullscreen = true;
@@ -1684,6 +1946,8 @@ delegate_shm!(PurpState);
 delegate_seat!(PurpState);
 delegate_data_device!(PurpState);
 delegate_primary_selection!(PurpState);
+delegate_data_control!(PurpState);
+delegate_idle_inhibit!(PurpState);
 delegate_viewporter!(PurpState);
 delegate_single_pixel_buffer!(PurpState);
 delegate_fractional_scale!(PurpState);

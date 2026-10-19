@@ -20,8 +20,16 @@ install -m 755 "$SCRIPT_DIR/purpwm-wifi" /usr/local/bin/purpwm-wifi
 install -m 755 "$SCRIPT_DIR/purpwm-bt" /usr/local/bin/purpwm-bt
 install -m 755 "$SCRIPT_DIR/purpwm-polkit-agent" /usr/local/bin/purpwm-polkit-agent
 
+echo "Installing PAM configuration to /etc/pam.d/purpwm..."
+cat << 'EOF' > /etc/pam.d/purpwm
+#%PAM-1.0
+auth       include      system-auth
+account    include      system-auth
+EOF
+chmod 644 /etc/pam.d/purpwm
+
 echo "Installing Wayland session entry to /usr/share/wayland-sessions/purpwm.desktop..."
 install -m 644 "$SCRIPT_DIR/purpwm.desktop" /usr/share/wayland-sessions/purpwm.desktop
 
 echo ""
-echo "Successfully installed purpwm (with 2560x1600 native resolution, cursor, Wi-Fi, Bluetooth & OS Keyring/Polkit) to COSMIC greeter!"
+echo "Successfully installed purpwm (with 2560x1600 native resolution, touch, PAM lock screen, notifications, Wi-Fi, Bluetooth & OS Keyring/Polkit) to COSMIC greeter!"

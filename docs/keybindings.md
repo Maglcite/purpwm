@@ -7,8 +7,11 @@
 
 | Keys | Action |
 | :--- | :--- |
+| `Mod + Shift + l` / `Mod + Ctrl + l` | Lock the screen (built-in PAM lock screen; also `XF86ScreenSaver` or `kill -USR2 $(pidof purpwm)`) |
 | `Mod + Shift + q` | Quit purpwm (back to the login screen) |
 | `Mod + q` | Close the focused window |
+
+While locked, type your password and press `Enter` to unlock (`BackSpace` deletes one character; `Escape` or `Ctrl + u` clears the input).
 
 ## Launching
 
@@ -88,23 +91,27 @@ These work without `Mod`.
 | Mic mute | `wpctl` / `pactl` |
 | Brightness up / down | `brightnessctl`, or logind when it's not installed |
 | Play-pause / next / previous | `playerctl` |
+| `XF86ScreenSaver` | Lock the screen |
 | `Print` | Screenshot of the whole screen |
 | `Shift + Print` / `Mod + Print` | Screenshot of the focused window |
 
 Screenshots are saved to `~/Pictures/Screenshots/purpwm-YYYYmmdd-HHMMSS.png` and placed
 on the clipboard as `image/png`. Scripts can trigger one with `kill -USR1 $(pidof purpwm)`.
 
-## Mouse
+## Mouse & Touch
 
 | Action | Effect |
 | :--- | :--- |
-| `Mod + Left-drag` | Move a window (floats it) |
+| `Mod + Left-drag` / `Mod + Touch-drag` | Move a window (floats it) |
 | `Mod + Right-drag` | Resize a window (floats it) |
 | `Mod + Middle-click` | Toggle floating |
+| Tap window / overlay / popup | Focus the surface and forward native `wl_touch` events |
+| Tap status bar pill / tag | Trigger the corresponding status bar action |
+| Click or tap notification toast | Dismiss the notification |
 
 ## Status bar
 
-| Target | Left-click | Right-click | Other |
+| Target | Left-click / Tap | Right-click | Other |
 | :--- | :--- | :--- | :--- |
 | Tag `1..9` | View tag (`Shift`: move window there) | Toggle tag in view | Middle: move window there |
 | Layout symbol | Next layout | Previous layout | |

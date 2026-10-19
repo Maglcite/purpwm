@@ -6,6 +6,8 @@
 pub mod bar;
 pub mod config;
 pub mod input;
+pub mod lock;
+pub mod notify;
 pub mod render;
 pub mod state;
 #[cfg(test)]
@@ -26,7 +28,7 @@ use smithay::{
         allocator::Fourcc,
         input::{
             AbsolutePositionEvent, ButtonState, Event, InputEvent, KeyboardKeyEvent,
-            PointerButtonEvent, PointerMotionEvent,
+            PointerButtonEvent, PointerMotionEvent, TouchEvent,
         },
         renderer::{
             gles::{GlesError, GlesMapping, GlesRenderer, GlesTarget},
@@ -43,7 +45,7 @@ use smithay::{
             window::{Fullscreen, Window as WinitWindow},
         },
     },
-    utils::{Buffer, Logical, Physical, Rectangle, Size, Transform},
+    utils::{Buffer, IsAlive, Logical, Physical, Rectangle, Size, Transform},
 };
 
 use crate::{
@@ -66,7 +68,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let spawn_initial_terminal = args.iter().any(|a| a == "--spawn-terminal");
     let no_autostart = args.iter().any(|a| a == "--no-autostart");
-    let is_standalone = args.iter().any(|a| a == "--standalone" || a == "--fullscreen")
+    let is_standalone = args
+        .iter()
+        .any(|a| a == "--standalone" || a == "--fullscreen")
         || std::env::var_os("PURPWM_STANDALONE").is_some();
 
     run_winit(spawn_initial_terminal, is_standalone, no_autostart)
@@ -95,6 +99,7 @@ fn print_usage() {
          \x20 Mod + Shift + b    Open Bluetooth Manager (or Left-Click BT pill in top bar)\n\
          \x20 Mod + Ctrl + b     Toggle Bluetooth Power On/Off (or Right-Click BT pill in top bar)\n\
          \x20 Mod + s / Mod + `  Toggle drop-down Scratchpad Terminal\n\
+         \x20 Mod + Shift/Ctrl+l Lock screen with built-in PAM screen locker (also kill -USR2)\n\
          \x20 Mod + Arrow Keys   Move focused window (swap in tiled mode, nudge in floating mode)\n\
          \x20 Mod + Shift+Arrows Resize focused floating window\n\
          \x20 Mod + j / k        Focus next / previous window\n\
@@ -159,9 +164,14 @@ fn logical_output_size(physical: Size<i32, Physical>, scale: f64) -> Size<i32, L
 }
 
 static SCREENSHOT_SIGNAL: AtomicBool = AtomicBool::new(false);
+static LOCK_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_screenshot_signal(_: libc::c_int) {
     SCREENSHOT_SIGNAL.store(true, Ordering::Relaxed);
+}
+
+extern "C" fn on_lock_signal(_: libc::c_int) {
+    LOCK_SIGNAL.store(true, Ordering::Relaxed);
 }
 
 /// Start reading back the finished frame (or the requested window region) into a GPU buffer.
@@ -294,19 +304,27 @@ pub fn run_winit(
         is_standalone
     );
 
-    // Ensure Wi-Fi and Bluetooth are enabled & connected, pre-warm Spotlight daemon, and run autostart
+    // Ensure Wi-Fi and Bluetooth are enabled & connected, pre-warm Spotlight daemon,
+    // start built-in notification daemon, and run autostart
     if !no_autostart {
         state.ensure_network_and_bluetooth();
         state.spawn_spotlight_daemon();
+        state.spawn_notification_daemon();
         state.run_autostart();
         state.spawn_polkit_agent();
+    } else if std::env::var_os("PURPWM_NOTIFY_DBUS").is_some() {
+        state.spawn_notification_daemon();
     }
 
-    // `kill -USR1 <pid>` takes a screenshot (scriptable, no extra protocol needed)
+    // `kill -USR1 <pid>` takes a screenshot; `kill -USR2 <pid>` locks the session
     unsafe {
         libc::signal(
             libc::SIGUSR1,
             on_screenshot_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGUSR2,
+            on_lock_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
         );
     }
 
@@ -358,6 +376,23 @@ pub fn run_winit(
                     InputEvent::PointerAxis { event } => {
                         state.process_pointer_axis::<WinitInput>(event);
                     }
+                    InputEvent::TouchDown { event } => {
+                        let pos = state.touch_physical_to_logical(event.x(), event.y());
+                        state.process_touch_down(event.slot(), pos, Event::time_msec(&event));
+                    }
+                    InputEvent::TouchMotion { event } => {
+                        let pos = state.touch_physical_to_logical(event.x(), event.y());
+                        state.process_touch_motion(event.slot(), pos, Event::time_msec(&event));
+                    }
+                    InputEvent::TouchUp { event } => {
+                        state.process_touch_up(event.slot(), Event::time_msec(&event));
+                    }
+                    InputEvent::TouchCancel { event } => {
+                        state.process_touch_cancel(event.slot());
+                    }
+                    InputEvent::TouchFrame { .. } => {
+                        state.process_touch_frame();
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -378,6 +413,10 @@ pub fn run_winit(
 
         let dispatched = display.dispatch_clients(&mut state)?;
 
+        if LOCK_SIGNAL.swap(false, Ordering::Relaxed) {
+            state.lock_session();
+            needs_render = true;
+        }
         if SCREENSHOT_SIGNAL.swap(false, Ordering::Relaxed) {
             state.request_screenshot(false);
         }
@@ -387,11 +426,15 @@ pub fn run_winit(
         display.flush_clients()?;
 
         let status_changed = state.bar.tick_status();
+        let lock_changed = state.poll_lock_screen();
+        let notif_changed = state.notifications.tick();
 
         if had_winit_events
             || accepted_client
             || dispatched > 0
             || status_changed
+            || lock_changed
+            || notif_changed
             || state.bar.is_dirty()
             || state.active_grab.is_some()
             || state.screenshot_request.is_some()
@@ -437,19 +480,26 @@ pub fn run_winit(
                 }
             }
 
-            // Only visible surfaces get frame callbacks, so clients on hidden tags stop
-            // redrawing (and stop waking the compositor) until they are shown again.
-            let elapsed_ms = start_time.elapsed().as_millis() as u32;
-            let tags = state.workspace.selected_tags;
-            for win in state.windows.iter().filter(|w| w.is_visible_on(tags)) {
-                send_frames_surface_tree(win.wl_surface(), elapsed_ms);
-            }
-            for (popup, _) in state.visible_popups() {
-                send_frames_surface_tree(popup.wl_surface(), elapsed_ms);
-            }
-            for layer in &state.layer_surfaces {
-                if layer.surface.alive() {
-                    send_frames_surface_tree(layer.surface.wl_surface(), elapsed_ms);
+            // Only visible surfaces get frame callbacks, so clients on hidden tags (or while
+            // the session is locked) stop redrawing until they are shown again.
+            if !state.is_locked() {
+                let elapsed_ms = start_time.elapsed().as_millis() as u32;
+                let tags = state.workspace.selected_tags;
+                for win in state.windows.iter().filter(|w| w.is_visible_on(tags)) {
+                    send_frames_surface_tree(win.wl_surface(), elapsed_ms);
+                }
+                for (popup, _) in state.visible_popups() {
+                    send_frames_surface_tree(popup.wl_surface(), elapsed_ms);
+                }
+                for layer in &state.layer_surfaces {
+                    if layer.surface.alive() {
+                        send_frames_surface_tree(layer.surface.wl_surface(), elapsed_ms);
+                    }
+                }
+                if let Some(ref icon) = state.dnd_icon {
+                    if icon.alive() {
+                        send_frames_surface_tree(icon, elapsed_ms);
+                    }
                 }
             }
 

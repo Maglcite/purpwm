@@ -295,6 +295,11 @@ impl StatusBar {
         None
     }
 
+    /// The loaded status bar font (shared with the lock screen).
+    pub fn font(&self) -> Option<&Font> {
+        self.font.as_ref()
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -486,10 +491,13 @@ impl StatusBar {
         // 4. Local wall-clock time via libc::localtime_r
         let clock = Self::format_local_time();
 
-        format!("{}CPU {}  |  MEM {}  |  {}", bat_prefix, cpu, mem_str, clock)
+        format!(
+            "{}CPU {}  |  MEM {}  |  {}",
+            bat_prefix, cpu, mem_str, clock
+        )
     }
 
-    fn format_local_time() -> String {
+    pub(crate) fn format_local_time() -> String {
         unsafe {
             let now = libc::time(std::ptr::null_mut());
             let mut tm: libc::tm = std::mem::zeroed();
@@ -750,8 +758,7 @@ impl StatusBar {
             metrics_range_out = (right_cursor, w);
 
             // Volume clickable pill (`[ VOL 45% ]`): click mutes, scroll adjusts, right-click mixer
-            let vol_text_w =
-                measure_text(font_ref, glyph_cache, &snap.volume_label, font_px);
+            let vol_text_w = measure_text(font_ref, glyph_cache, &snap.volume_label, font_px);
             let vol_pill_w = vol_text_w + px(20);
             right_cursor -= vol_pill_w + px(8);
             if right_cursor > cur_x + px(40) {
@@ -760,7 +767,16 @@ impl StatusBar {
                 } else {
                     BAR_TEXT_DIM_RGBA
                 };
-                fill_rect(buf, w, h, right_cursor, px(3), vol_pill_w, h - px(7), BAR_LAYOUT_BG_RGBA);
+                fill_rect(
+                    buf,
+                    w,
+                    h,
+                    right_cursor,
+                    px(3),
+                    vol_pill_w,
+                    h - px(7),
+                    BAR_LAYOUT_BG_RGBA,
+                );
                 draw_text(
                     buf,
                     w,
@@ -808,8 +824,7 @@ impl StatusBar {
             }
 
             // Wi-Fi clickable pill (`[ WIFI: ... ]`)
-            let wifi_text_w =
-                measure_text(font_ref, glyph_cache, &snap.wifi_label, font_px);
+            let wifi_text_w = measure_text(font_ref, glyph_cache, &snap.wifi_label, font_px);
             let wifi_pill_w = wifi_text_w + px(20);
             right_cursor -= wifi_pill_w + px(8);
             if right_cursor > cur_x + px(40) {
@@ -823,7 +838,16 @@ impl StatusBar {
                 } else {
                     BAR_TEXT_DIM_RGBA
                 };
-                fill_rect(buf, w, h, right_cursor, px(3), wifi_pill_w, h - px(7), wifi_bg);
+                fill_rect(
+                    buf,
+                    w,
+                    h,
+                    right_cursor,
+                    px(3),
+                    wifi_pill_w,
+                    h - px(7),
+                    wifi_bg,
+                );
                 draw_text(
                     buf,
                     w,
@@ -863,9 +887,7 @@ impl StatusBar {
                 );
             }
 
-            Result::<Vec<Rectangle<i32, Buffer>>, ()>::Ok(vec![Rectangle::from_size(
-                (w, h).into(),
-            )])
+            Result::<Vec<Rectangle<i32, Buffer>>, ()>::Ok(vec![Rectangle::from_size((w, h).into())])
         });
         drop(ctx);
         self.layout_cell_end = layout_end_out;
@@ -977,7 +999,7 @@ fn put_pixel_argb8888(buf: &mut [u8], stride_w: i32, h: i32, x: i32, y: i32, rgb
 
 /// Alpha-blend a foreground glyph pixel onto an existing premultiplied `Argb8888` pixel.
 #[inline]
-fn blend_pixel_argb8888(
+pub(crate) fn blend_pixel_argb8888(
     buf: &mut [u8],
     stride_w: i32,
     h: i32,
@@ -1014,7 +1036,7 @@ fn blend_pixel_argb8888(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fill_rect(
+pub(crate) fn fill_rect(
     buf: &mut [u8],
     stride_w: i32,
     buf_h: i32,

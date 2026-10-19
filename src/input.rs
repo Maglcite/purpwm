@@ -1,7 +1,9 @@
-//! Keyboard and pointer input handling for `purpwm`, including:
+//! Keyboard, pointer, and touch input handling for `purpwm`, including:
 //! - Solo `Mod` tap detection (press and release `Mod` alone to launch `/home/mag/Documents/Spotlight`)
 //! - `Mod + Arrow` keys to move windows around (and `Mod + Shift + Arrow` to resize)
 //! - Full `dwm` keybindings (`Mod + 1..9`, `Mod + j/k`, `Mod + h/l`, `Mod + Return`, etc.)
+//! - Built-in PAM lock screen (`Mod + Shift + l` / `Mod + Ctrl + l` / `XF86ScreenSaver`)
+//! - Native Wayland touch input (`wl_touch`) with status bar taps, window focus, and `Mod + Touch` move
 //! - Wi-Fi (`Mod + w`, `Mod + Shift + w`) and Bluetooth (`Mod + Shift + b`) controls + clickable bar pills
 //! - System monitor (`Mod + Escape` or clicking CPU/MEM/BAT pill)
 //! - Additional layouts (`Mod + u` CenteredMaster `|M|`, `Mod + g` Grid `###`)
@@ -12,10 +14,12 @@
 use smithay::{
     backend::input::{
         Axis, AxisSource, ButtonState, Event, InputBackend, KeyState, Keycode, PointerAxisEvent,
+        TouchSlot,
     },
     input::{
         keyboard::{keysyms, FilterResult, Keysym, ModifiersState},
         pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
+        touch::{DownEvent as TouchDown, MotionEvent as TouchMotion, UpEvent as TouchUp},
     },
     utils::{Logical, Point, SERIAL_COUNTER},
     wayland::{
@@ -27,12 +31,17 @@ use smithay::{
 use crate::{
     bar::BarClickAction,
     config::{BAR_HEIGHT, SCALE_STEP, TAGMASK, TAG_NAMES},
+    lock::LockKey,
     state::{InteractiveGrab, PurpState},
     wm::LayoutMode,
 };
 
 /// Scroll distance (one mouse-wheel notch) needed to switch tags from the status bar.
 const BAR_SCROLL_STEP: f64 = 15.0;
+
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 
 /// Compositor action triggered by a keybinding or solo-Mod release.
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +54,7 @@ pub enum KeyAction {
     SpawnBluetooth,
     ToggleBluetooth,
     ToggleScratchpad,
+    LockScreen,
     CloseWindow,
     Quit,
     FocusDelta(isize),
@@ -116,255 +126,288 @@ fn keysym_to_tag_index(sym: Keysym) -> Option<usize> {
     }
 }
 
+/// Translate a key press on the lock screen into a [`LockKey`] edit/submit action.
+pub(crate) fn keysym_to_lock_key(sym: Keysym, mods: &ModifiersState) -> Option<LockKey> {
+    match sym.raw() {
+        keysyms::KEY_Return | keysyms::KEY_KP_Enter => Some(LockKey::Submit),
+        keysyms::KEY_BackSpace => Some(LockKey::Backspace),
+        keysyms::KEY_Escape => Some(LockKey::Clear),
+        keysyms::KEY_u | keysyms::KEY_U if mods.ctrl => Some(LockKey::Clear),
+        _ if !mods.ctrl && !mods.alt && !mods.logo => sym
+            .key_char()
+            .filter(|c| !c.is_control())
+            .map(LockKey::Char),
+        _ => None,
+    }
+}
+
 impl PurpState {
     /// Process a physical key press/release event through the Wayland seat keyboard.
     pub fn process_keyboard_event(&mut self, keycode: Keycode, state: KeyState, time: u32) {
         let keyboard = self.keyboard.clone();
         let mut solo_mod_tap = false;
 
-        let intercepted: Option<Option<KeyAction>> = keyboard
-            .input(
-                self,
-                keycode,
-                state,
-                SERIAL_COUNTER.next_serial(),
-                time,
-                |app, mods, handle| {
-                    app.modifiers = *mods;
-                    let sym = handle.modified_sym();
+        let intercepted: Option<Option<KeyAction>> = keyboard.input(
+            self,
+            keycode,
+            state,
+            SERIAL_COUNTER.next_serial(),
+            time,
+            |app, mods, handle| {
+                app.modifiers = *mods;
+                let sym = handle.modified_sym();
 
-                    // 1. Solo-Mod tap detection. The Mod release is still forwarded so the
-                    //    focused client never believes Super/Alt is stuck down.
-                    if is_mod_keysym(sym) {
-                        match state {
-                            KeyState::Pressed => {
-                                app.mod_tap_candidate = true;
-                            }
-                            KeyState::Released => {
-                                solo_mod_tap = std::mem::take(&mut app.mod_tap_candidate);
-                            }
-                        }
-                        return FilterResult::Forward;
-                    }
-
-                    // Any non-Mod key press cancels the solo-Mod tap candidate.
+                // 0. While locked, swallow every key event so no client can read typing;
+                //    route key presses to the PAM lock screen instead.
+                if app.is_locked() {
+                    app.mod_tap_candidate = false;
                     if state == KeyState::Pressed {
-                        app.mod_tap_candidate = false;
-                        // A fresh press decides again whether this key's release is swallowed.
-                        app.intercepted_keys.retain(|k| *k != keycode);
-                    } else {
-                        // Swallow the release of keys whose press was a compositor binding.
-                        if let Some(pos) = app.intercepted_keys.iter().position(|k| *k == keycode) {
-                            app.intercepted_keys.swap_remove(pos);
-                            return FilterResult::Intercept(None);
+                        if let Some(lock_key) = keysym_to_lock_key(sym, mods) {
+                            if let Some(ref mut lock) = app.lock_screen {
+                                lock.handle_key(lock_key);
+                            }
                         }
-                        return FilterResult::Forward;
                     }
+                    return FilterResult::Intercept(None);
+                }
 
-                    // 2. Global hardware media / brightness / screenshot keys (work without Mod)
-                    match sym.raw() {
-                        keysyms::KEY_XF86AudioRaiseVolume => {
-                            return FilterResult::Intercept(Some(KeyAction::VolumeUp));
+                // 1. Solo-Mod tap detection. The Mod release is still forwarded so the
+                //    focused client never believes Super/Alt is stuck down.
+                if is_mod_keysym(sym) {
+                    match state {
+                        KeyState::Pressed => {
+                            app.mod_tap_candidate = true;
                         }
-                        keysyms::KEY_XF86AudioLowerVolume => {
-                            return FilterResult::Intercept(Some(KeyAction::VolumeDown));
+                        KeyState::Released => {
+                            solo_mod_tap = std::mem::take(&mut app.mod_tap_candidate);
                         }
-                        keysyms::KEY_XF86AudioMute => {
-                            return FilterResult::Intercept(Some(KeyAction::VolumeMute));
-                        }
-                        keysyms::KEY_XF86AudioMicMute => {
-                            return FilterResult::Intercept(Some(KeyAction::MicMute));
-                        }
-                        keysyms::KEY_XF86MonBrightnessUp => {
-                            return FilterResult::Intercept(Some(KeyAction::BrightnessUp));
-                        }
-                        keysyms::KEY_XF86MonBrightnessDown => {
-                            return FilterResult::Intercept(Some(KeyAction::BrightnessDown));
-                        }
-                        keysyms::KEY_XF86AudioPlay | keysyms::KEY_XF86AudioPause => {
-                            return FilterResult::Intercept(Some(KeyAction::MediaPlay));
-                        }
-                        keysyms::KEY_XF86AudioNext => {
-                            return FilterResult::Intercept(Some(KeyAction::MediaNext));
-                        }
-                        keysyms::KEY_XF86AudioPrev => {
-                            return FilterResult::Intercept(Some(KeyAction::MediaPrev));
-                        }
-                        keysyms::KEY_Print => {
-                            let act = if mods.shift || is_mod_active(mods) {
-                                KeyAction::ScreenshotWindow
-                            } else {
-                                KeyAction::Screenshot
-                            };
-                            return FilterResult::Intercept(Some(act));
-                        }
-                        _ => {}
                     }
+                    return FilterResult::Forward;
+                }
 
-                    // 3. Check if Mod is held for compositor shortcuts.
-                    if !is_mod_active(mods) {
-                        return FilterResult::Forward;
+                // Any non-Mod key press cancels the solo-Mod tap candidate.
+                if state == KeyState::Pressed {
+                    app.mod_tap_candidate = false;
+                    // A fresh press decides again whether this key's release is swallowed.
+                    app.intercepted_keys.retain(|k| *k != keycode);
+                } else {
+                    // Swallow the release of keys whose press was a compositor binding.
+                    if let Some(pos) = app.intercepted_keys.iter().position(|k| *k == keycode) {
+                        app.intercepted_keys.swap_remove(pos);
+                        return FilterResult::Intercept(None);
                     }
+                    return FilterResult::Forward;
+                }
 
-                    // Tag shortcuts (`Mod + [Ctrl] + [Shift] + 1..9`)
-                    if let Some(tag_idx) = keysym_to_tag_index(sym) {
-                        let mask = 1u16 << tag_idx;
-                        let act = match (mods.ctrl, mods.shift) {
-                            (false, false) => KeyAction::ViewTags(mask),
-                            (true, false) => KeyAction::ToggleViewTags(mask),
-                            (false, true) => KeyAction::TagWindow(mask),
-                            (true, true) => KeyAction::ToggleTagWindow(mask),
-                        };
-                        return FilterResult::Intercept(Some(act));
+                // 2. Global hardware media / brightness / screenshot / lock keys (work without Mod)
+                match sym.raw() {
+                    keysyms::KEY_XF86AudioRaiseVolume => {
+                        return FilterResult::Intercept(Some(KeyAction::VolumeUp));
                     }
-
-                    // `Mod + 0` / `Mod + Shift + 0` -> view all tags / sticky window on all tags
-                    if matches!(sym.raw(), keysyms::KEY_0 | keysyms::KEY_parenright) {
-                        let act = if mods.ctrl {
-                            KeyAction::ResetGaps
-                        } else if mods.shift {
-                            KeyAction::TagWindow(TAGMASK)
+                    keysyms::KEY_XF86AudioLowerVolume => {
+                        return FilterResult::Intercept(Some(KeyAction::VolumeDown));
+                    }
+                    keysyms::KEY_XF86AudioMute => {
+                        return FilterResult::Intercept(Some(KeyAction::VolumeMute));
+                    }
+                    keysyms::KEY_XF86AudioMicMute => {
+                        return FilterResult::Intercept(Some(KeyAction::MicMute));
+                    }
+                    keysyms::KEY_XF86MonBrightnessUp => {
+                        return FilterResult::Intercept(Some(KeyAction::BrightnessUp));
+                    }
+                    keysyms::KEY_XF86MonBrightnessDown => {
+                        return FilterResult::Intercept(Some(KeyAction::BrightnessDown));
+                    }
+                    keysyms::KEY_XF86AudioPlay | keysyms::KEY_XF86AudioPause => {
+                        return FilterResult::Intercept(Some(KeyAction::MediaPlay));
+                    }
+                    keysyms::KEY_XF86AudioNext => {
+                        return FilterResult::Intercept(Some(KeyAction::MediaNext));
+                    }
+                    keysyms::KEY_XF86AudioPrev => {
+                        return FilterResult::Intercept(Some(KeyAction::MediaPrev));
+                    }
+                    keysyms::KEY_XF86ScreenSaver => {
+                        return FilterResult::Intercept(Some(KeyAction::LockScreen));
+                    }
+                    keysyms::KEY_Print => {
+                        let act = if mods.shift || is_mod_active(mods) {
+                            KeyAction::ScreenshotWindow
                         } else {
-                            KeyAction::ViewTags(TAGMASK)
+                            KeyAction::Screenshot
                         };
                         return FilterResult::Intercept(Some(act));
                     }
+                    _ => {}
+                }
 
-                    // Arrow keys: `Mod + Arrow` moves window, `Mod + Shift + Arrow` resizes window
-                    match sym.raw() {
-                        keysyms::KEY_Left => {
-                            let act = if mods.shift {
-                                KeyAction::ResizeWindow(-1, 0)
-                            } else {
-                                KeyAction::MoveWindow(-1, 0)
-                            };
-                            return FilterResult::Intercept(Some(act));
-                        }
-                        keysyms::KEY_Right => {
-                            let act = if mods.shift {
-                                KeyAction::ResizeWindow(1, 0)
-                            } else {
-                                KeyAction::MoveWindow(1, 0)
-                            };
-                            return FilterResult::Intercept(Some(act));
-                        }
-                        keysyms::KEY_Up => {
-                            let act = if mods.shift {
-                                KeyAction::ResizeWindow(0, -1)
-                            } else {
-                                KeyAction::MoveWindow(0, -1)
-                            };
-                            return FilterResult::Intercept(Some(act));
-                        }
-                        keysyms::KEY_Down => {
-                            let act = if mods.shift {
-                                KeyAction::ResizeWindow(0, 1)
-                            } else {
-                                KeyAction::MoveWindow(0, 1)
-                            };
-                            return FilterResult::Intercept(Some(act));
-                        }
-                        _ => {}
-                    }
+                // 3. Check if Mod is held for compositor shortcuts.
+                if !is_mod_active(mods) {
+                    return FilterResult::Forward;
+                }
 
-                    // Standard dwm + daily-driver bindings
-                    let maybe_act = match sym.raw() {
-                        keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
-                            if mods.shift {
-                                Some(KeyAction::Zoom)
-                            } else {
-                                Some(KeyAction::SpawnTerminal)
-                            }
-                        }
-                        keysyms::KEY_Escape => Some(KeyAction::SpawnSystemMonitor),
-                        keysyms::KEY_p | keysyms::KEY_P => Some(KeyAction::SpawnLauncher),
-                        keysyms::KEY_w | keysyms::KEY_W => {
-                            if mods.shift {
-                                Some(KeyAction::ToggleWifi)
-                            } else {
-                                Some(KeyAction::SpawnWifi)
-                            }
-                        }
-                        keysyms::KEY_s | keysyms::KEY_S | keysyms::KEY_grave => {
-                            Some(KeyAction::ToggleScratchpad)
-                        }
-                        keysyms::KEY_j | keysyms::KEY_J => Some(KeyAction::FocusDelta(1)),
-                        keysyms::KEY_k | keysyms::KEY_K => Some(KeyAction::FocusDelta(-1)),
-                        keysyms::KEY_h | keysyms::KEY_H => Some(KeyAction::AdjustMfact(-0.05)),
-                        keysyms::KEY_l | keysyms::KEY_L => Some(KeyAction::AdjustMfact(0.05)),
-                        keysyms::KEY_i | keysyms::KEY_I => Some(KeyAction::AdjustNmaster(1)),
-                        keysyms::KEY_d | keysyms::KEY_D => Some(KeyAction::AdjustNmaster(-1)),
-                        keysyms::KEY_t | keysyms::KEY_T => {
-                            Some(KeyAction::SetLayout(LayoutMode::Tile))
-                        }
-                        keysyms::KEY_m | keysyms::KEY_M => {
-                            Some(KeyAction::SetLayout(LayoutMode::Monocle))
-                        }
-                        keysyms::KEY_u | keysyms::KEY_U => {
-                            Some(KeyAction::SetLayout(LayoutMode::CenteredMaster))
-                        }
-                        keysyms::KEY_g | keysyms::KEY_G => {
-                            if mods.shift {
-                                Some(KeyAction::ToggleGaps)
-                            } else {
-                                Some(KeyAction::SetLayout(LayoutMode::Grid))
-                            }
-                        }
-                        keysyms::KEY_f | keysyms::KEY_F => {
-                            if mods.shift {
-                                Some(KeyAction::ToggleFullscreen)
-                            } else {
-                                Some(KeyAction::SetLayout(LayoutMode::Floating))
-                            }
-                        }
-                        keysyms::KEY_F11 => Some(KeyAction::ToggleFullscreen),
-                        keysyms::KEY_o | keysyms::KEY_O => Some(KeyAction::ToggleOpacity),
-                        keysyms::KEY_equal | keysyms::KEY_plus if mods.ctrl => {
-                            Some(KeyAction::AdjustScale(SCALE_STEP))
-                        }
-                        keysyms::KEY_minus | keysyms::KEY_underscore if mods.ctrl => {
-                            Some(KeyAction::AdjustScale(-SCALE_STEP))
-                        }
-                        keysyms::KEY_equal | keysyms::KEY_plus => Some(KeyAction::AdjustGaps(2)),
-                        keysyms::KEY_minus | keysyms::KEY_underscore => {
-                            Some(KeyAction::AdjustGaps(-2))
-                        }
-                        keysyms::KEY_space => {
-                            if mods.shift {
-                                Some(KeyAction::ToggleFloating)
-                            } else if mods.ctrl {
-                                Some(KeyAction::CycleLayout)
-                            } else {
-                                Some(KeyAction::ToggleLastLayout)
-                            }
-                        }
-                        keysyms::KEY_b | keysyms::KEY_B => {
-                            if mods.shift {
-                                Some(KeyAction::SpawnBluetooth)
-                            } else if mods.ctrl {
-                                Some(KeyAction::ToggleBluetooth)
-                            } else {
-                                Some(KeyAction::ToggleBar)
-                            }
-                        }
-                        keysyms::KEY_Tab => Some(KeyAction::SwapPrevTags),
-                        keysyms::KEY_q | keysyms::KEY_Q => {
-                            if mods.shift {
-                                Some(KeyAction::Quit)
-                            } else {
-                                Some(KeyAction::CloseWindow)
-                            }
-                        }
-                        _ => None,
+                // Tag shortcuts (`Mod + [Ctrl] + [Shift] + 1..9`)
+                if let Some(tag_idx) = keysym_to_tag_index(sym) {
+                    let mask = 1u16 << tag_idx;
+                    let act = match (mods.ctrl, mods.shift) {
+                        (false, false) => KeyAction::ViewTags(mask),
+                        (true, false) => KeyAction::ToggleViewTags(mask),
+                        (false, true) => KeyAction::TagWindow(mask),
+                        (true, true) => KeyAction::ToggleTagWindow(mask),
                     };
+                    return FilterResult::Intercept(Some(act));
+                }
 
-                    if let Some(act) = maybe_act {
-                        FilterResult::Intercept(Some(act))
+                // `Mod + 0` / `Mod + Shift + 0` -> view all tags / sticky window on all tags
+                if matches!(sym.raw(), keysyms::KEY_0 | keysyms::KEY_parenright) {
+                    let act = if mods.ctrl {
+                        KeyAction::ResetGaps
+                    } else if mods.shift {
+                        KeyAction::TagWindow(TAGMASK)
                     } else {
-                        FilterResult::Forward
+                        KeyAction::ViewTags(TAGMASK)
+                    };
+                    return FilterResult::Intercept(Some(act));
+                }
+
+                // Arrow keys: `Mod + Arrow` moves window, `Mod + Shift + Arrow` resizes window
+                match sym.raw() {
+                    keysyms::KEY_Left => {
+                        let act = if mods.shift {
+                            KeyAction::ResizeWindow(-1, 0)
+                        } else {
+                            KeyAction::MoveWindow(-1, 0)
+                        };
+                        return FilterResult::Intercept(Some(act));
                     }
-                },
-            );
+                    keysyms::KEY_Right => {
+                        let act = if mods.shift {
+                            KeyAction::ResizeWindow(1, 0)
+                        } else {
+                            KeyAction::MoveWindow(1, 0)
+                        };
+                        return FilterResult::Intercept(Some(act));
+                    }
+                    keysyms::KEY_Up => {
+                        let act = if mods.shift {
+                            KeyAction::ResizeWindow(0, -1)
+                        } else {
+                            KeyAction::MoveWindow(0, -1)
+                        };
+                        return FilterResult::Intercept(Some(act));
+                    }
+                    keysyms::KEY_Down => {
+                        let act = if mods.shift {
+                            KeyAction::ResizeWindow(0, 1)
+                        } else {
+                            KeyAction::MoveWindow(0, 1)
+                        };
+                        return FilterResult::Intercept(Some(act));
+                    }
+                    _ => {}
+                }
+
+                // Standard dwm + daily-driver bindings
+                let maybe_act = match sym.raw() {
+                    keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
+                        if mods.shift {
+                            Some(KeyAction::Zoom)
+                        } else {
+                            Some(KeyAction::SpawnTerminal)
+                        }
+                    }
+                    keysyms::KEY_Escape => Some(KeyAction::SpawnSystemMonitor),
+                    keysyms::KEY_p | keysyms::KEY_P => Some(KeyAction::SpawnLauncher),
+                    keysyms::KEY_w | keysyms::KEY_W => {
+                        if mods.shift {
+                            Some(KeyAction::ToggleWifi)
+                        } else {
+                            Some(KeyAction::SpawnWifi)
+                        }
+                    }
+                    keysyms::KEY_s | keysyms::KEY_S | keysyms::KEY_grave => {
+                        Some(KeyAction::ToggleScratchpad)
+                    }
+                    keysyms::KEY_j | keysyms::KEY_J => Some(KeyAction::FocusDelta(1)),
+                    keysyms::KEY_k | keysyms::KEY_K => Some(KeyAction::FocusDelta(-1)),
+                    keysyms::KEY_h | keysyms::KEY_H => Some(KeyAction::AdjustMfact(-0.05)),
+                    keysyms::KEY_l | keysyms::KEY_L => {
+                        if mods.shift || mods.ctrl {
+                            Some(KeyAction::LockScreen)
+                        } else {
+                            Some(KeyAction::AdjustMfact(0.05))
+                        }
+                    }
+                    keysyms::KEY_i | keysyms::KEY_I => Some(KeyAction::AdjustNmaster(1)),
+                    keysyms::KEY_d | keysyms::KEY_D => Some(KeyAction::AdjustNmaster(-1)),
+                    keysyms::KEY_t | keysyms::KEY_T => Some(KeyAction::SetLayout(LayoutMode::Tile)),
+                    keysyms::KEY_m | keysyms::KEY_M => {
+                        Some(KeyAction::SetLayout(LayoutMode::Monocle))
+                    }
+                    keysyms::KEY_u | keysyms::KEY_U => {
+                        Some(KeyAction::SetLayout(LayoutMode::CenteredMaster))
+                    }
+                    keysyms::KEY_g | keysyms::KEY_G => {
+                        if mods.shift {
+                            Some(KeyAction::ToggleGaps)
+                        } else {
+                            Some(KeyAction::SetLayout(LayoutMode::Grid))
+                        }
+                    }
+                    keysyms::KEY_f | keysyms::KEY_F => {
+                        if mods.shift {
+                            Some(KeyAction::ToggleFullscreen)
+                        } else {
+                            Some(KeyAction::SetLayout(LayoutMode::Floating))
+                        }
+                    }
+                    keysyms::KEY_F11 => Some(KeyAction::ToggleFullscreen),
+                    keysyms::KEY_o | keysyms::KEY_O => Some(KeyAction::ToggleOpacity),
+                    keysyms::KEY_equal | keysyms::KEY_plus if mods.ctrl => {
+                        Some(KeyAction::AdjustScale(SCALE_STEP))
+                    }
+                    keysyms::KEY_minus | keysyms::KEY_underscore if mods.ctrl => {
+                        Some(KeyAction::AdjustScale(-SCALE_STEP))
+                    }
+                    keysyms::KEY_equal | keysyms::KEY_plus => Some(KeyAction::AdjustGaps(2)),
+                    keysyms::KEY_minus | keysyms::KEY_underscore => Some(KeyAction::AdjustGaps(-2)),
+                    keysyms::KEY_space => {
+                        if mods.shift {
+                            Some(KeyAction::ToggleFloating)
+                        } else if mods.ctrl {
+                            Some(KeyAction::CycleLayout)
+                        } else {
+                            Some(KeyAction::ToggleLastLayout)
+                        }
+                    }
+                    keysyms::KEY_b | keysyms::KEY_B => {
+                        if mods.shift {
+                            Some(KeyAction::SpawnBluetooth)
+                        } else if mods.ctrl {
+                            Some(KeyAction::ToggleBluetooth)
+                        } else {
+                            Some(KeyAction::ToggleBar)
+                        }
+                    }
+                    keysyms::KEY_Tab => Some(KeyAction::SwapPrevTags),
+                    keysyms::KEY_q | keysyms::KEY_Q => {
+                        if mods.shift {
+                            Some(KeyAction::Quit)
+                        } else {
+                            Some(KeyAction::CloseWindow)
+                        }
+                    }
+                    _ => None,
+                };
+
+                if let Some(act) = maybe_act {
+                    FilterResult::Intercept(Some(act))
+                } else {
+                    FilterResult::Forward
+                }
+            },
+        );
 
         if state == KeyState::Pressed && intercepted.is_some() {
             self.intercepted_keys.push(keycode);
@@ -387,6 +430,7 @@ impl PurpState {
             KeyAction::SpawnBluetooth => self.spawn_bluetooth_manager(),
             KeyAction::ToggleBluetooth => self.toggle_bluetooth_power(),
             KeyAction::ToggleScratchpad => self.toggle_scratchpad(),
+            KeyAction::LockScreen => self.lock_session(),
             KeyAction::CloseWindow => self.close_focused(),
             KeyAction::Quit => self.should_quit = true,
             KeyAction::FocusDelta(delta) => self.cycle_focus(delta),
@@ -452,6 +496,99 @@ impl PurpState {
         }
     }
 
+    /// Apply an active interactive window move/resize grab for the given pointer/touch location.
+    fn update_interactive_grab(&mut self, position: Point<f64, Logical>) -> bool {
+        let Some(grab) = self.active_grab.clone() else {
+            return false;
+        };
+        let (surface, start_pointer, start_geo, is_move) = match grab {
+            InteractiveGrab::Move {
+                surface,
+                start_pointer,
+                start_geo,
+            } => (surface, start_pointer, start_geo, true),
+            InteractiveGrab::Resize {
+                surface,
+                start_pointer,
+                start_geo,
+            } => (surface, start_pointer, start_geo, false),
+        };
+        let Some(w) = self.windows.iter_mut().find(|w| w.wl_surface() == &surface) else {
+            self.active_grab = None;
+            self.touch_grab_slot = None;
+            return true;
+        };
+        let dx = (position.x - start_pointer.x).round() as i32;
+        let dy = (position.y - start_pointer.y).round() as i32;
+        if is_move {
+            w.float_geo.loc.x = start_geo.loc.x + dx;
+            w.float_geo.loc.y = start_geo.loc.y + dy;
+        } else {
+            w.float_geo.size.w = (start_geo.size.w + dx).max(120);
+            w.float_geo.size.h = (start_geo.size.h + dy).max(80);
+        }
+        w.geo = w.float_geo;
+        self.relayout();
+        true
+    }
+
+    /// Execute a top status bar click/tap action at logical `x` with `button`.
+    fn handle_bar_click(&mut self, x: i32, button: u32) {
+        match self.bar.hit_test(x) {
+            BarClickAction::Tag(idx) => {
+                let mask = 1u16 << idx;
+                if button == BTN_RIGHT || self.modifiers.ctrl {
+                    self.toggle_view_tags(mask);
+                } else if button == BTN_MIDDLE || self.modifiers.shift {
+                    self.tag_focused_window(mask);
+                } else {
+                    self.view_tags(mask);
+                }
+            }
+            BarClickAction::CycleLayout => {
+                if button == BTN_RIGHT {
+                    let prev = self.workspace.prev_layout();
+                    self.set_layout(prev);
+                } else {
+                    let next = self.workspace.layout().next();
+                    self.set_layout(next);
+                }
+            }
+            BarClickAction::Wifi => {
+                if button == BTN_RIGHT {
+                    self.toggle_wifi_radio();
+                } else {
+                    self.spawn_wifi_manager();
+                }
+            }
+            BarClickAction::Bluetooth => {
+                if button == BTN_RIGHT {
+                    self.toggle_bluetooth_power();
+                } else {
+                    self.spawn_bluetooth_manager();
+                }
+            }
+            BarClickAction::Volume => {
+                if button == BTN_RIGHT {
+                    self.spawn_mixer();
+                } else {
+                    self.spawn_volume_mute();
+                    self.bar.request_immediate_status_refresh();
+                }
+            }
+            BarClickAction::SystemMonitor => {
+                self.spawn_system_monitor();
+            }
+            BarClickAction::FocusNext => {
+                if button == BTN_MIDDLE {
+                    self.spawn_terminal();
+                } else {
+                    self.cycle_focus(1);
+                }
+            }
+        }
+    }
+
     /// Handle relative pointer motion (used by `--tty-udev` libinput mouse/touchpad movement).
     pub fn process_pointer_move_relative(
         &mut self,
@@ -462,6 +599,11 @@ impl PurpState {
         let new_x = (self.pointer_location.x + delta.x).clamp(0.0, (self.output_size.w - 1) as f64);
         let new_y = (self.pointer_location.y + delta.y).clamp(0.0, (self.output_size.h - 1) as f64);
         let new_pos = Point::from((new_x, new_y));
+
+        if self.is_locked() {
+            self.pointer_location = new_pos;
+            return;
+        }
 
         let under = self.surface_under(new_pos);
 
@@ -481,36 +623,11 @@ impl PurpState {
     /// Handle pointer motion in logical coordinates (layer-shell overlays first, then sloppy focus-follows-mouse + interactive move/resize).
     pub fn process_pointer_motion(&mut self, position: Point<f64, Logical>, time: u32) {
         self.pointer_location = position;
+        if self.is_locked() {
+            return;
+        }
 
-        if let Some(grab) = self.active_grab.clone() {
-            let (surface, start_pointer, start_geo, is_move) = match grab {
-                InteractiveGrab::Move {
-                    surface,
-                    start_pointer,
-                    start_geo,
-                } => (surface, start_pointer, start_geo, true),
-                InteractiveGrab::Resize {
-                    surface,
-                    start_pointer,
-                    start_geo,
-                } => (surface, start_pointer, start_geo, false),
-            };
-            let Some(w) = self.windows.iter_mut().find(|w| w.wl_surface() == &surface) else {
-                // The dragged window closed mid-drag.
-                self.active_grab = None;
-                return;
-            };
-            let dx = (position.x - start_pointer.x).round() as i32;
-            let dy = (position.y - start_pointer.y).round() as i32;
-            if is_move {
-                w.float_geo.loc.x = start_geo.loc.x + dx;
-                w.float_geo.loc.y = start_geo.loc.y + dy;
-            } else {
-                w.float_geo.size.w = (start_geo.size.w + dx).max(120);
-                w.float_geo.size.h = (start_geo.size.h + dy).max(80);
-            }
-            w.geo = w.float_geo;
-            self.relayout();
+        if self.touch_grab_slot.is_none() && self.update_interactive_grab(position) {
             return;
         }
 
@@ -551,6 +668,9 @@ impl PurpState {
 
     /// Handle mouse wheel / touchpad two-finger scroll (`InputEvent::PointerAxis`).
     pub fn process_pointer_axis<B: InputBackend>(&mut self, event: B::PointerAxisEvent) {
+        if self.is_locked() {
+            return;
+        }
         let pos = self.pointer_location;
         // Mouse wheels only report discrete v120 steps; clients still need a continuous
         // value (15 per notch, like libinput) or many of them ignore the scroll entirely.
@@ -615,15 +735,28 @@ impl PurpState {
         if state == ButtonState::Pressed {
             self.mod_tap_candidate = false;
         }
+        if self.is_locked() {
+            return;
+        }
 
-        if state == ButtonState::Released {
-            if self.active_grab.take().is_some() {
-                self.relayout();
-                return;
-            }
+        if state == ButtonState::Released
+            && self.touch_grab_slot.is_none()
+            && self.active_grab.take().is_some()
+        {
+            self.relayout();
+            return;
         }
 
         let pos = self.pointer_location;
+
+        // Dismiss a notification toast if clicked
+        if state == ButtonState::Pressed
+            && self
+                .notifications
+                .dismiss_at(pos, self.output_size.w, self.bar_visible())
+        {
+            return;
+        }
 
         // 0. If clicking on a layer-shell overlay (Spotlight), forward directly to it
         if let Some((layer_surface, _)) = self.layer_surface_at(pos) {
@@ -645,10 +778,6 @@ impl PurpState {
             return;
         }
 
-        const BTN_LEFT: u32 = 0x110;
-        const BTN_RIGHT: u32 = 0x111;
-        const BTN_MIDDLE: u32 = 0x112;
-
         // Menus sit above everything: clicks on them go straight to the client.
         if self.popup_at(pos) {
             self.forward_pointer_button(button, state, time);
@@ -661,59 +790,7 @@ impl PurpState {
             && pos.y >= 0.0
             && pos.y < BAR_HEIGHT as f64
         {
-            match self.bar.hit_test(pos.x as i32) {
-                BarClickAction::Tag(idx) => {
-                    let mask = 1u16 << idx;
-                    if button == BTN_RIGHT || self.modifiers.ctrl {
-                        self.toggle_view_tags(mask);
-                    } else if button == BTN_MIDDLE || self.modifiers.shift {
-                        self.tag_focused_window(mask);
-                    } else {
-                        self.view_tags(mask);
-                    }
-                }
-                BarClickAction::CycleLayout => {
-                    if button == BTN_RIGHT {
-                        let prev = self.workspace.prev_layout();
-                        self.set_layout(prev);
-                    } else {
-                        let next = self.workspace.layout().next();
-                        self.set_layout(next);
-                    }
-                }
-                BarClickAction::Wifi => {
-                    if button == BTN_RIGHT {
-                        self.toggle_wifi_radio();
-                    } else {
-                        self.spawn_wifi_manager();
-                    }
-                }
-                BarClickAction::Bluetooth => {
-                    if button == BTN_RIGHT {
-                        self.toggle_bluetooth_power();
-                    } else {
-                        self.spawn_bluetooth_manager();
-                    }
-                }
-                BarClickAction::Volume => {
-                    if button == BTN_RIGHT {
-                        self.spawn_mixer();
-                    } else {
-                        self.spawn_volume_mute();
-                        self.bar.request_immediate_status_refresh();
-                    }
-                }
-                BarClickAction::SystemMonitor => {
-                    self.spawn_system_monitor();
-                }
-                BarClickAction::FocusNext => {
-                    if button == BTN_MIDDLE {
-                        self.spawn_terminal();
-                    } else {
-                        self.cycle_focus(1);
-                    }
-                }
-            }
+            self.handle_bar_click(pos.x as i32, button);
             return;
         }
 
@@ -733,6 +810,7 @@ impl PurpState {
                 let start_geo = w.float_geo;
                 let surface = w.wl_surface().clone();
                 if button == BTN_LEFT {
+                    self.touch_grab_slot = None;
                     self.active_grab = Some(InteractiveGrab::Move {
                         surface,
                         start_pointer: pos,
@@ -741,6 +819,7 @@ impl PurpState {
                     self.relayout();
                     return;
                 } else if button == BTN_RIGHT {
+                    self.touch_grab_slot = None;
                     self.active_grab = Some(InteractiveGrab::Resize {
                         surface,
                         start_pointer: pos,
@@ -783,5 +862,201 @@ impl PurpState {
         if state == ButtonState::Pressed {
             self.sync_keyboard_focus();
         }
+    }
+
+    // ========================================================================
+    // NATIVE TOUCH INPUT (`wl_touch`)
+    // ========================================================================
+
+    /// Handle a touch-down event in logical coordinates: notification dismissal, layer overlays,
+    /// popups, top status bar taps, `Mod + Touch` interactive window dragging, window focus, and
+    /// `wl_touch::down` forwarding to Wayland clients.
+    pub fn process_touch_down(&mut self, slot: TouchSlot, pos: Point<f64, Logical>, time: u32) {
+        self.mod_tap_candidate = false;
+        self.touch_locations.insert(slot, pos);
+        self.pointer_location = pos;
+
+        if self.is_locked() {
+            return;
+        }
+
+        if self
+            .notifications
+            .dismiss_at(pos, self.output_size.w, self.bar_visible())
+        {
+            return;
+        }
+
+        // 0. Layer-shell overlay (Spotlight)
+        if let Some((layer_surface, _)) = self.layer_surface_at(pos) {
+            let on_demand = with_states(&layer_surface, |states| {
+                states
+                    .cached_state
+                    .get::<LayerSurfaceCachedState>()
+                    .current()
+                    .keyboard_interactivity
+                    == KeyboardInteractivity::OnDemand
+            });
+            if on_demand {
+                self.layer_focus = Some(layer_surface);
+                self.sync_keyboard_focus();
+            }
+            let under = self.surface_under(pos);
+            let serial = SERIAL_COUNTER.next_serial();
+            let touch = self.touch.clone();
+            touch.down(
+                self,
+                under,
+                &TouchDown {
+                    slot,
+                    location: pos,
+                    serial,
+                    time,
+                },
+            );
+            touch.frame(self);
+            return;
+        }
+
+        // Popups sit above windows and the bar
+        if self.popup_at(pos) {
+            let under = self.surface_under(pos);
+            let serial = SERIAL_COUNTER.next_serial();
+            let touch = self.touch.clone();
+            touch.down(
+                self,
+                under,
+                &TouchDown {
+                    slot,
+                    location: pos,
+                    serial,
+                    time,
+                },
+            );
+            touch.frame(self);
+            return;
+        }
+
+        // 1. Tapping on the top status bar activates tags, layouts, Wi-Fi, BT, volume, or monitor
+        if self.bar_visible() && pos.y >= 0.0 && pos.y < BAR_HEIGHT as f64 {
+            self.handle_bar_click(pos.x as i32, BTN_LEFT);
+            return;
+        }
+
+        // 2. `Mod + Touch` interactive window move
+        if is_mod_active(&self.modifiers) {
+            if let Some((idx, _)) = self.window_at(pos) {
+                self.focused_idx = Some(idx);
+                let w = &mut self.windows[idx];
+                if !w.is_floating && !w.is_scratchpad {
+                    w.is_floating = true;
+                    w.float_geo = w.geo;
+                }
+                let start_geo = w.float_geo;
+                let surface = w.wl_surface().clone();
+                self.touch_grab_slot = Some(slot);
+                self.active_grab = Some(InteractiveGrab::Move {
+                    surface,
+                    start_pointer: pos,
+                    start_geo,
+                });
+                self.relayout();
+                return;
+            }
+        }
+
+        // 3. Focus touched window and forward `wl_touch::down` to the client surface
+        self.layer_focus = None;
+        if let Some((idx, _)) = self.window_at(pos) {
+            if self.focused_idx != Some(idx) {
+                self.focused_idx = Some(idx);
+                self.relayout();
+            }
+        }
+
+        let under = self.surface_under(pos);
+        let serial = SERIAL_COUNTER.next_serial();
+        let touch = self.touch.clone();
+        touch.down(
+            self,
+            under,
+            &TouchDown {
+                slot,
+                location: pos,
+                serial,
+                time,
+            },
+        );
+        touch.frame(self);
+        self.sync_keyboard_focus();
+    }
+
+    /// Handle touch point motion in logical coordinates.
+    pub fn process_touch_motion(&mut self, slot: TouchSlot, pos: Point<f64, Logical>, time: u32) {
+        self.touch_locations.insert(slot, pos);
+        self.pointer_location = pos;
+
+        if self.is_locked() {
+            return;
+        }
+
+        if self.touch_grab_slot == Some(slot) && self.update_interactive_grab(pos) {
+            return;
+        }
+
+        let under = self.surface_under(pos);
+        let touch = self.touch.clone();
+        touch.motion(
+            self,
+            under,
+            &TouchMotion {
+                slot,
+                location: pos,
+                time,
+            },
+        );
+        touch.frame(self);
+    }
+
+    /// Handle touch point release (`wl_touch::up`).
+    pub fn process_touch_up(&mut self, slot: TouchSlot, time: u32) {
+        self.touch_locations.remove(&slot);
+
+        if self.touch_grab_slot == Some(slot) {
+            self.touch_grab_slot = None;
+            if self.active_grab.take().is_some() {
+                self.relayout();
+                return;
+            }
+        }
+
+        if self.is_locked() {
+            return;
+        }
+
+        let serial = SERIAL_COUNTER.next_serial();
+        let touch = self.touch.clone();
+        touch.up(self, &TouchUp { slot, serial, time });
+        touch.frame(self);
+    }
+
+    /// Handle touch session cancellation (`wl_touch::cancel`).
+    pub fn process_touch_cancel(&mut self, slot: TouchSlot) {
+        self.touch_locations.remove(&slot);
+        if self.touch_grab_slot == Some(slot) {
+            self.touch_grab_slot = None;
+            self.active_grab = None;
+        }
+        let touch = self.touch.clone();
+        touch.cancel(self);
+    }
+
+    /// Handle explicit touch frame boundary (`wl_touch::frame`).
+    pub fn process_touch_frame(&mut self) {
+        if self.is_locked() {
+            return;
+        }
+        let touch = self.touch.clone();
+        touch.frame(self);
     }
 }
