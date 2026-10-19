@@ -183,6 +183,7 @@ impl ManagedLayerSurface {
             (output_size.h - h) / 2
         };
 
+        self.layer = state.layer;
         self.geo = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
     }
 

@@ -241,7 +241,7 @@ pub fn render_output_frame<'a>(
     let mut layer_batches: Vec<LayerRenderBatch> = Vec::with_capacity(state.layer_surfaces.len());
 
     for layer in &state.layer_surfaces {
-        if !layer.surface.alive() {
+        if !layer.surface.alive() || layer.namespace == "Spotlight-keepalive" {
             continue;
         }
         let loc_phys = layer.geo.loc.to_physical_precise_round(scale);
