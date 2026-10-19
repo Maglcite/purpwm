@@ -1,0 +1,95 @@
+#!/bin/sh
+set -e
+
+# If invoked from /usr/local/bin/start-purpwm after user login, delegate to the live repo script
+# so future rebuilds or script tweaks in /home/mag/Documents/purpwm take effect without sudo!
+if [ "$1" = "--delegated" ]; then
+    shift
+elif [ -x "/home/mag/Documents/purpwm/start-purpwm" ] && [ "$0" != "/home/mag/Documents/purpwm/start-purpwm" ]; then
+    exec /home/mag/Documents/purpwm/start-purpwm --delegated "$@"
+fi
+
+# Ensure XDG_RUNTIME_DIR and systemd user D-Bus session bus are set properly
+UID_NUM="$(id -u)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID_NUM}"
+if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+
+# Export standard Wayland desktop session environment
+export XDG_CURRENT_DESKTOP=purpwm
+export XDG_SESSION_DESKTOP=purpwm
+export XDG_SESSION_TYPE=wayland
+export QT_QPA_PLATFORM="wayland;xcb"
+export GDK_BACKEND="wayland,x11"
+export MOZ_ENABLE_WAYLAND=1
+export ELECTRON_OZONE_PLATFORM_HINT=auto
+export _JAVA_AWT_WM_NONREPARENTING=1
+
+# Ensure user's ~/.local/bin and cargo bin are in PATH
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:$PATH"
+
+# Unlock / attach gnome-keyring-daemon for Wi-Fi & secret storage
+if command -v gnome-keyring-daemon >/dev/null 2>&1; then
+    eval "$(gnome-keyring-daemon --start --components=pkcs11,secrets,ssh 2>/dev/null || true)"
+fi
+if [ -S "$XDG_RUNTIME_DIR/gcr/ssh" ]; then
+    export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/gcr/ssh"
+elif [ -S "$XDG_RUNTIME_DIR/keyring/ssh" ]; then
+    export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/keyring/ssh"
+fi
+
+# Import environment into systemd user session
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user import-environment XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DBUS_SESSION_BUS_ADDRESS SSH_AUTH_SOCK PATH 2>/dev/null || true
+fi
+
+# Ensure Wi-Fi and Bluetooth are active on session login
+(
+    nmcli networking on >/dev/null 2>&1 || true
+    nmcli radio wifi on >/dev/null 2>&1 || true
+    rfkill unblock bluetooth >/dev/null 2>&1 || true
+    bluetoothctl power on >/dev/null 2>&1 || true
+) &
+
+# Prefer the live release binary in /home/mag/Documents/purpwm/target/release/purpwm first
+if [ -x "/home/mag/Documents/purpwm/target/release/purpwm" ]; then
+    PURPWM_BIN="/home/mag/Documents/purpwm/target/release/purpwm"
+elif [ -x "$HOME/.local/bin/purpwm" ]; then
+    PURPWM_BIN="$HOME/.local/bin/purpwm"
+elif [ -x "/usr/local/bin/purpwm" ]; then
+    PURPWM_BIN="/usr/local/bin/purpwm"
+else
+    PURPWM_BIN="purpwm"
+fi
+
+# Detect native DRM panel resolution (e.g. 2560x1600 on card1-eDP-1)
+NATIVE_W=2560
+NATIVE_H=1600
+for d in /sys/class/drm/card*-*; do
+    if [ -f "$d/status" ] && [ "$(cat "$d/status" 2>/dev/null)" = "connected" ] && [ -f "$d/modes" ]; then
+        MODE="$(head -n 1 "$d/modes" 2>/dev/null)"
+        if [ -n "$MODE" ]; then
+            W="${MODE%x*}"
+            H="${MODE#*x}"
+            if [ "$W" -ge 640 ] 2>/dev/null && [ "$H" -ge 480 ] 2>/dev/null; then
+                NATIVE_W="$W"
+                NATIVE_H="$H"
+                break
+            fi
+        fi
+    fi
+done
+
+# Check if running nested (inside an existing Wayland or X11 compositor)
+# or standalone (launched from COSMIC greeter / greetd on VT)
+if [ -n "$WAYLAND_DISPLAY" ] || [ -n "$DISPLAY" ]; then
+    exec "$PURPWM_BIN" "$@"
+else
+    export PURPWM_STANDALONE=1
+    if command -v gamescope >/dev/null 2>&1; then
+        exec gamescope -W "$NATIVE_W" -H "$NATIVE_H" -w "$NATIVE_W" -h "$NATIVE_H" -r 120 -f --expose-wayland -- "$PURPWM_BIN" --standalone "$@"
+    else
+        exec "$PURPWM_BIN" --standalone "$@"
+    fi
+fi

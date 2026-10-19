@@ -1,0 +1,15 @@
+#!/bin/sh
+# purpwm Wi-Fi Manager launcher
+# Enables Wi-Fi radio, triggers a background scan, and opens nmtui in a centered floating window.
+
+nmcli networking on >/dev/null 2>&1 || true
+nmcli radio wifi on >/dev/null 2>&1 || true
+(nmcli device wifi rescan >/dev/null 2>&1 || true) &
+
+if command -v alacritty >/dev/null 2>&1 && command -v nmtui >/dev/null 2>&1; then
+    exec alacritty --class purpwm-control -t "purpwm Wi-Fi Manager" -e nmtui
+elif command -v nm-connection-editor >/dev/null 2>&1; then
+    exec nm-connection-editor
+elif command -v cosmic-settings >/dev/null 2>&1; then
+    exec cosmic-settings wireless
+fi

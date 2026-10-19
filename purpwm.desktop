@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=purpwm
+Comment=Translucent Purple dwm-Inspired Wayland Compositor
+Exec=/usr/local/bin/start-purpwm
+TryExec=/usr/local/bin/start-purpwm
+Type=Application
+DesktopNames=purpwm
+Keywords=tiling;wm;windowmanager;wayland;dwm;purple;

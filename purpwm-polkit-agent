@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""
+purpwm Polkit Authentication Agent
+Ultra-lightweight, translucent-purple styled graphical authentication dialog
+built with GTK4 and PolkitAgent.
+Registers with polkitd to handle authorization requests (e.g. gparted, wireshark, system updates).
+"""
+
+import os
+import sys
+import threading
+
+import gi
+
+gi.require_version("GLib", "2.0")
+gi.require_version("Gio", "2.0")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Polkit", "1.0")
+gi.require_version("PolkitAgent", "1.0")
+
+from gi.repository import GLib, Gio, Gtk, Polkit, PolkitAgent
+
+
+class PurpPolkitDialog(Gtk.Window):
+    def __init__(self, action_id, message, user_name, session, finish_cb):
+        super().__init__(title="Authentication Required — purpwm")
+        self.set_default_size(440, 260)
+        self.set_modal(True)
+        self.session = session
+        self.finish_cb = finish_cb
+        self.completed = False
+
+        # Apply translucent purple CSS styling
+        css_provider = Gtk.CssProvider()
+        css = b"""
+        window {
+            background-color: #170B29;
+            color: #F3E8FF;
+            border: 2px solid #A855F7;
+            border-radius: 12px;
+        }
+        headerbar {
+            background-color: #24123E;
+            color: #F3E8FF;
+            border-bottom: 1px solid #7C3AED;
+        }
+        entry {
+            background-color: #2A1447;
+            color: #FAF5FF;
+            border: 1px solid #7C3AED;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 14px;
+        }
+        entry:focus {
+            border: 1px solid #C084FC;
+            box-shadow: 0 0 6px #A855F7;
+        }
+        button.suggested-action {
+            background-color: #7C3AED;
+            color: #FFFFFF;
+            font-weight: bold;
+            border-radius: 6px;
+            padding: 8px 16px;
+        }
+        button.suggested-action:hover {
+            background-color: #9333EA;
+        }
+        button {
+            background-color: #2A1447;
+            color: #E9D5FF;
+            border: 1px solid #4C1D95;
+            border-radius: 6px;
+            padding: 8px 16px;
+        }
+        label.title {
+            font-weight: bold;
+            font-size: 16px;
+            color: #F3E8FF;
+        }
+        label.msg {
+            color: #D8B4FE;
+            font-size: 13px;
+        }
+        label.error {
+            color: #F43F5E;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        """
+        css_provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_display(
+            self.get_display(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        box.set_margin_top(20)
+        box.set_margin_bottom(20)
+        box.set_margin_start(24)
+        box.set_margin_end(24)
+        self.set_child(box)
+
+        # Title / Action
+        title_label = Gtk.Label(label="Authentication Required")
+        title_label.add_css_class("title")
+        title_label.set_xalign(0.0)
+        box.append(title_label)
+
+        # Message description
+        msg_text = message if message else f"Action: {action_id}"
+        msg_label = Gtk.Label(label=msg_text)
+        msg_label.add_css_class("msg")
+        msg_label.set_wrap(True)
+        msg_label.set_xalign(0.0)
+        box.append(msg_label)
+
+        # Password Entry
+        self.entry = Gtk.PasswordEntry()
+        self.entry.set_show_peek_icon(True)
+        self.entry.connect("activate", self.on_authenticate)
+        box.append(self.entry)
+
+        # Error label (hidden initially)
+        self.error_label = Gtk.Label(label="")
+        self.error_label.add_css_class("error")
+        self.error_label.set_xalign(0.0)
+        self.error_label.set_visible(False)
+        box.append(self.error_label)
+
+        # Buttons
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        btn_box.set_halign(Gtk.Align.END)
+        box.append(btn_box)
+
+        cancel_btn = Gtk.Button(label="Cancel")
+        cancel_btn.connect("clicked", self.on_cancel)
+        btn_box.append(cancel_btn)
+
+        auth_btn = Gtk.Button(label="Authenticate")
+        auth_btn.add_css_class("suggested-action")
+        auth_btn.connect("clicked", self.on_authenticate)
+        btn_box.append(auth_btn)
+
+        # Connect session signals
+        session.connect("request", self.on_session_request)
+        session.connect("show-error", self.on_session_error)
+        session.connect("show-info", self.on_session_info)
+        session.connect("completed", self.on_session_completed)
+
+        self.connect("close-request", self.on_close_request)
+
+    def on_session_request(self, session, request, echo_on):
+        self.error_label.set_visible(False)
+
+    def on_session_error(self, session, text):
+        self.error_label.set_text(text)
+        self.error_label.set_visible(True)
+
+    def on_session_info(self, session, text):
+        pass
+
+    def on_session_completed(self, session, gained_authorization):
+        self.completed = True
+        self.finish_cb(gained_authorization)
+        self.destroy()
+
+    def on_authenticate(self, widget):
+        text = self.entry.get_text()
+        self.session.response(text)
+        self.entry.set_text("")
+
+    def on_cancel(self, widget):
+        if not self.completed:
+            self.session.cancel()
+            self.finish_cb(False)
+        self.destroy()
+
+    def on_close_request(self, window):
+        if not self.completed:
+            self.session.cancel()
+            self.finish_cb(False)
+        return False
+
+
+class PurpListener(PolkitAgent.Listener):
+    def __init__(self):
+        super().__init__()
+
+    def do_initiate_authentication(
+        self, action_id, message, icon_name, details, cookie, identities
+    ):
+        ident = identities[0] if identities else None
+        session = PolkitAgent.Session.new(ident, cookie)
+
+        user_name = os.environ.get("USER", "root")
+
+        def finish_callback(success):
+            self.initiate_authentication_finish(None)
+
+        def show_dialog():
+            win = PurpPolkitDialog(action_id, message, user_name, session, finish_callback)
+            win.present()
+            session.initiate()
+
+        GLib.idle_add(show_dialog)
+
+
+def main():
+    app = Gtk.Application(application_id="org.purpwm.PolkitAuthenticationAgent")
+
+    def on_activate(application):
+        listener = PurpListener()
+        try:
+            subject = Polkit.UnixSession.new_for_process_sync(os.getpid(), None)
+        except Exception:
+            subject = Polkit.UnixProcess.new_for_pid(os.getpid())
+        try:
+            listener.register(PolkitAgent.RegisterFlags.NONE, subject, "/org/purpwm/PolicyKit1/AuthenticationAgent", None)
+            print("purpwm Polkit Authentication Agent successfully registered.")
+        except Exception as e:
+            print(f"Polkit agent registration notice: {e}")
+
+    app.connect("activate", on_activate)
+    # Run GLib main loop indefinitely
+    app.run([])
+
+
+if __name__ == "__main__":
+    main()

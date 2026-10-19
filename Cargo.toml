@@ -1,0 +1,30 @@
+[package]
+name = "purpwm"
+version = "0.1.0"
+edition = "2021"
+description = "An ultra-lightweight dwm-inspired dynamic tiling Wayland compositor in Rust with a translucent purple theme"
+license = "MIT"
+
+[dependencies]
+smithay = { version = "0.7.0", default-features = false, features = [
+    "backend_winit",
+    "backend_drm",
+    "backend_gbm",
+    "backend_udev",
+    "backend_libinput",
+    "backend_session_libseat",
+    "desktop",
+    "renderer_gl",
+    "wayland_frontend",
+] }
+bitflags = "2.6"
+fontdue = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

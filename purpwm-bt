@@ -1,0 +1,124 @@
+#!/bin/bash
+# purpwm Interactive Bluetooth Manager
+# If not already running inside our floating terminal, launch inside alacritty --class purpwm-control.
+
+if [ "$1" != "--tui" ]; then
+    if command -v alacritty >/dev/null 2>&1; then
+        exec alacritty --class purpwm-control -t "purpwm Bluetooth Manager" -e "$0" --tui
+    elif command -v cosmic-settings >/dev/null 2>&1; then
+        exec cosmic-settings bluetooth
+    fi
+fi
+
+rfkill unblock bluetooth >/dev/null 2>&1 || true
+
+PURPLE='\033[1;35m'
+LAVENDER='\033[0;35m'
+GREEN='\033[1;32m'
+DIM='\033[0;90m'
+BOLD='\033[1;37m'
+RESET='\033[0m'
+
+while true; do
+    clear
+    echo -e "${PURPLE}============================================================${RESET}"
+    echo -e "${BOLD}              purpwm — Bluetooth Control Center             ${RESET}"
+    echo -e "${PURPLE}============================================================${RESET}"
+
+    POWERED=$(bluetoothctl show 2>/dev/null | grep -i "Powered:" | awk '{print $2}')
+    if [ "$POWERED" = "yes" ]; then
+        echo -e "  Controller Status: ${GREEN}ONLINE (Powered ON)${RESET}"
+    else
+        echo -e "  Controller Status: ${DIM}OFFLINE (Powered OFF)${RESET}"
+    fi
+    echo ""
+    echo -e "${LAVENDER}  Devices:${RESET}"
+
+    mapfile -t DEVICES < <(bluetoothctl devices 2>/dev/null)
+    CONNECTED_LIST=$(bluetoothctl devices Connected 2>/dev/null)
+
+    if [ ${#DEVICES[@]} -eq 0 ]; then
+        echo -e "    ${DIM}(No devices found — press 's' to scan)${RESET}"
+    else
+        idx=1
+        for line in "${DEVICES[@]}"; do
+            mac=$(echo "$line" | awk '{print $2}')
+            name=$(echo "$line" | cut -d' ' -f3-)
+            if echo "$CONNECTED_LIST" | grep -q "$mac"; then
+                echo -e "    ${PURPLE}[$idx]${RESET} ${BOLD}$name${RESET} ${DIM}($mac)${RESET} ${GREEN}[CONNECTED]${RESET}"
+            else
+                echo -e "    ${PURPLE}[$idx]${RESET} $name ${DIM}($mac)${RESET}"
+            fi
+            idx=$((idx + 1))
+        done
+    fi
+
+    echo ""
+    echo -e "${PURPLE}------------------------------------------------------------${RESET}"
+    echo -e "  ${BOLD}[1-9]${RESET} Connect / Disconnect device #"
+    echo -e "  ${BOLD}[s]${RESET}   Scan for nearby Bluetooth devices (6s)"
+    echo -e "  ${BOLD}[p]${RESET}   Pair & Trust a device by #"
+    echo -e "  ${BOLD}[t]${RESET}   Toggle Bluetooth Power (ON/OFF)"
+    echo -e "  ${BOLD}[g]${RESET}   Open GUI Bluetooth Settings"
+    echo -e "  ${BOLD}[q]${RESET}   Quit"
+    echo -e "${PURPLE}------------------------------------------------------------${RESET}"
+    printf "  Select action: "
+    read -r -n 1 choice
+    echo ""
+
+    case "$choice" in
+        [1-9])
+            arr_idx=$((choice - 1))
+            if [ $arr_idx -lt ${#DEVICES[@]} ]; then
+                line="${DEVICES[$arr_idx]}"
+                mac=$(echo "$line" | awk '{print $2}')
+                name=$(echo "$line" | cut -d' ' -f3-)
+                if echo "$CONNECTED_LIST" | grep -q "$mac"; then
+                    echo -e "  Disconnecting ${BOLD}$name${RESET}..."
+                    bluetoothctl disconnect "$mac"
+                else
+                    echo -e "  Connecting to ${BOLD}$name${RESET}..."
+                    bluetoothctl power on >/dev/null 2>&1 || true
+                    bluetoothctl connect "$mac"
+                fi
+                sleep 1
+            fi
+            ;;
+        s|S)
+            bluetoothctl power on >/dev/null 2>&1 || true
+            echo -e "  ${PURPLE}Scanning for nearby Bluetooth devices for 6 seconds...${RESET}"
+            bluetoothctl --timeout 6 scan on
+            ;;
+        p|P)
+            printf "  Enter device number to Pair & Trust: "
+            read -r num
+            if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le ${#DEVICES[@]} ]; then
+                line="${DEVICES[$((num - 1))]}"
+                mac=$(echo "$line" | awk '{print $2}')
+                echo -e "  Pairing, trusting, and connecting $mac..."
+                bluetoothctl pair "$mac" || true
+                bluetoothctl trust "$mac" || true
+                bluetoothctl connect "$mac" || true
+                sleep 1
+            fi
+            ;;
+        t|T)
+            if [ "$POWERED" = "yes" ]; then
+                bluetoothctl power off
+            else
+                rfkill unblock bluetooth >/dev/null 2>&1 || true
+                bluetoothctl power on
+            fi
+            sleep 0.5
+            ;;
+        g|G)
+            if command -v cosmic-settings >/dev/null 2>&1; then
+                nohup cosmic-settings bluetooth >/dev/null 2>&1 &
+                exit 0
+            fi
+            ;;
+        q|Q)
+            exit 0
+            ;;
+    esac
+done
