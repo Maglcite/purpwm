@@ -116,7 +116,7 @@ fn print_usage() {
          \x20 Print              Screenshot to ~/Pictures/Screenshots + clipboard (kill -USR1 too)\n\
          \x20 Shift/Mod + Print  Screenshot of the focused window only\n\
          \x20 VOL pill           Click: mute | Scroll: volume | Right-click: mixer\n\
-         \x20 Mod + Shift + c    Close focused window\n\
+         \x20 Mod + q            Close focused window\n\
          \x20 Mod + Shift + q    Quit purpwm",
         env!("CARGO_PKG_VERSION")
     );

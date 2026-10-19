@@ -796,7 +796,7 @@ impl PurpState {
         }
     }
 
-    /// Send `xdg_toplevel.close()` to the currently focused window (`Mod + Shift + c`).
+    /// Send `xdg_toplevel.close()` to the currently focused window (`Mod + q`).
     pub fn close_focused(&mut self) {
         if let Some(idx) = self.focused_idx {
             if let Some(w) = self.windows.get(idx) {

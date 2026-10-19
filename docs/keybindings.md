@@ -8,7 +8,7 @@
 | Keys | Action |
 | :--- | :--- |
 | `Mod + Shift + q` | Quit purpwm (back to the login screen) |
-| `Mod + Shift + c` | Close the focused window |
+| `Mod + q` | Close the focused window |
 
 ## Launching
 

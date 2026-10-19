@@ -348,10 +348,13 @@ impl PurpState {
                             }
                         }
                         keysyms::KEY_Tab => Some(KeyAction::SwapPrevTags),
-                        keysyms::KEY_c | keysyms::KEY_C if mods.shift => {
-                            Some(KeyAction::CloseWindow)
+                        keysyms::KEY_q | keysyms::KEY_Q => {
+                            if mods.shift {
+                                Some(KeyAction::Quit)
+                            } else {
+                                Some(KeyAction::CloseWindow)
+                            }
                         }
-                        keysyms::KEY_q | keysyms::KEY_Q if mods.shift => Some(KeyAction::Quit),
                         _ => None,
                     };
 
