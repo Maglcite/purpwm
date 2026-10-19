@@ -4,12 +4,13 @@ mod tests {
 
     use smithay::{
         input::keyboard::{keysyms, Keysym, ModifiersState},
-        utils::{Logical, Point, Rectangle, Size},
+        utils::{Logical, Physical, Point, Rectangle, Size},
     };
 
     use crate::{
         bar::{BarClickAction, StatusBar},
         config::{BAR_HEIGHT, GAP_INNER, GAP_OUTER},
+        help::{rasterize, HelpOverlay},
         input::keysym_to_lock_key,
         lock::{pam_check, LockKey, LockPoll, LockScreen, CONVERSATIONS},
         notify::{parse_dbus_notification_line, NotificationCenter},
@@ -210,5 +211,21 @@ mod tests {
 
         let _ = std::fs::remove_file(&sock_path);
         let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_help_overlay_toggle_and_rasterize() {
+        let mut help = HelpOverlay::default();
+        assert!(!help.visible);
+        help.toggle();
+        assert!(help.visible);
+        help.toggle();
+        assert!(!help.visible);
+
+        let bar = StatusBar::new(2560);
+        let out = Size::<i32, Physical>::from((2560, 1600));
+        let (_buf, loc) = rasterize(bar.font(), out, 1.5);
+        assert!(loc.x > 0 && loc.x < out.w / 2);
+        assert!(loc.y > 0 && loc.y < out.h / 2);
     }
 }

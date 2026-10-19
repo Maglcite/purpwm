@@ -1,12 +1,14 @@
 # Keybindings
 
 `Mod` is **Super** (Logo) or **Alt**. All bindings are defined in
-[`src/input.rs`](../src/input.rs).
+[`src/input.rs`](../src/input.rs). Press **`Mod + h`** at any time to display the
+built-in keybinding cheat sheet overlay (`Mod + h`, `Escape`, or any click / tap closes it).
 
 ## Session
 
 | Keys | Action |
 | :--- | :--- |
+| `Mod + h` | Show / hide the keybinding cheat sheet overlay (`Escape` or click / tap also closes) |
 | `Mod + Shift + l` / `Mod + Ctrl + l` | Lock the screen (built-in PAM lock screen; also `XF86ScreenSaver` or `kill -USR2 $(pidof purpwm)`) |
 | `Mod + Shift + q` | Quit purpwm (back to the login screen) |
 | `Mod + q` | Close the focused window |
@@ -54,7 +56,7 @@ move focus.
 | `Mod + f` | Floating `><>` |
 | `Mod + Space` | Toggle between the current and previous layout |
 | `Mod + Ctrl + Space` | Cycle through all layouts |
-| `Mod + h` / `Mod + l` | Shrink / grow the master area (`mfact` ± 0.05) |
+| `Mod + [` / `Mod + ]` (or `Mod + l`) | Shrink / grow the master area (`mfact` ± 0.05) |
 | `Mod + i` / `Mod + d` | More / fewer master windows (`nmaster`) |
 
 Layout, `mfact` and `nmaster` are remembered per tag.

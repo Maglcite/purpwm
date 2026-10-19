@@ -10,16 +10,17 @@
 //! 7. Renders `wlr-layer-shell` surfaces: `Background`/`Bottom` under the windows, `Top`/`Overlay`
 //!    (such as `/home/mag/Documents/Spotlight`) on top
 //! 8. Renders active desktop notification toasts (`NotificationCenter`) in the top-right corner
-//! 9. Renders any active Wayland drag-and-drop icon (`state.dnd_icon`) and the cursor
-//!    (client cursor surface, else the system XCursor theme, else a built-in purple arrow)
+//! 9. Renders the `Mod + h` keybinding cheat sheet overlay (`HelpOverlay`) when visible
+//! 10. Renders any active Wayland drag-and-drop icon (`state.dnd_icon`) and the cursor
+//!     (client cursor surface, else the system XCursor theme, else a built-in purple arrow)
 
 use smithay::{
     backend::renderer::{
         element::{
             memory::MemoryRenderBufferRenderElement,
             solid::SolidColorRenderElement,
-            utils::CropRenderElement,
             surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
+            utils::CropRenderElement,
             Id, Kind,
         },
         gles::{GlesError, GlesRenderer, GlesTarget},
@@ -155,7 +156,7 @@ pub fn render_output_frame<'a>(
         })
         .unwrap_or_else(|| {
             String::from(
-                "purpwm — Tap Mod: Spotlight | Mod+Enter: Term | Mod+w: Wi-Fi | Mod+Shift+b: BT",
+                "purpwm — Mod+h: Help | Tap Mod: Spotlight | Mod+Enter: Term | Mod+w: Wi-Fi | Mod+Shift+b: BT",
             )
         });
 
@@ -311,7 +312,15 @@ pub fn render_output_frame<'a>(
             .render_element(renderer, font, state.output_size.w, bar_visible, scale)
     };
 
-    // 6. Drag-and-drop icon surface (if an active client DnD session provided one)
+    // 6. Centred keybinding cheat sheet overlay (`Mod + h`)
+    let help_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> = {
+        let font = state.bar.font();
+        state
+            .help
+            .render_element(renderer, font, physical_size, scale)
+    };
+
+    // 7. Drag-and-drop icon surface (if an active client DnD session provided one)
     let dnd_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
         .dnd_icon
         .as_ref()
@@ -329,7 +338,7 @@ pub fn render_output_frame<'a>(
         })
         .unwrap_or_default();
 
-    // 7. Pointer cursor (not in screenshots): a client's own cursor surface, else the named
+    // 8. Pointer cursor (not in screenshots): a client's own cursor surface, else the named
     //    shape from the system cursor theme, else the built-in purple arrow.
     let mut cursor_surface_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
     let mut cursor_theme_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> = None;
@@ -369,7 +378,7 @@ pub fn render_output_frame<'a>(
         }
     }
 
-    // 8. Begin OpenGL ES frame & draw
+    // 9. Begin OpenGL ES frame & draw
     let mut frame = renderer.render(framebuffer, physical_size, transform)?;
 
     // Clear background with deep translucent purple
@@ -435,6 +444,11 @@ pub fn render_output_frame<'a>(
     // Draw desktop notification toasts
     if let Some(ref notif) = notif_elem {
         draw_render_elements(&mut frame, 1.0, std::slice::from_ref(notif), &[damage])?;
+    }
+
+    // Draw the `Mod + h` keybinding cheat sheet overlay
+    if let Some(ref help) = help_elem {
+        draw_render_elements(&mut frame, 1.0, std::slice::from_ref(help), &[damage])?;
     }
 
     // Draw drag-and-drop icon under the cursor

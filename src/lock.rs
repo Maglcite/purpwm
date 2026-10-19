@@ -306,7 +306,7 @@ impl LockScreen {
     }
 }
 
-fn measure(font: Option<&Font>, text: &str, px: f32) -> i32 {
+pub(crate) fn measure(font: Option<&Font>, text: &str, px: f32) -> i32 {
     let Some(font) = font else {
         return (text.chars().count() as i32) * ((px * 0.6) as i32).max(8);
     };
@@ -317,7 +317,7 @@ fn measure(font: Option<&Font>, text: &str, px: f32) -> i32 {
 
 /// Draw `text` with its top at `top` (glyphs rasterised on the fly; the lock screen redraws rarely).
 #[allow(clippy::too_many_arguments)]
-fn draw(
+pub(crate) fn draw(
     buf: &mut [u8],
     w: i32,
     h: i32,

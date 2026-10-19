@@ -5,7 +5,7 @@ A small, `dwm`-inspired dynamic tiling **Wayland compositor** written in Rust on
 
 - **dwm workflow**: 9 bitmask tags, master/stack tiling, per-tag layouts (`pertag`), `mfact` / `nmaster`, zoom, scratchpad.
 - **5 layouts**: Tile `[]=`, Centered Master `|M|`, Grid `###`, Monocle `[M]`, Floating `><>`.
-- **Translucent purple look**: glass-like window opacity, glowing focus borders, built-in status bar, high-contrast cursor.
+- **Translucent purple look**: glass-like window opacity, glowing focus borders, built-in status bar, system XCursor theme with purple fallback, and `Mod + h` keybinding cheat sheet overlay.
 - **HiDPI**: sharp fractional scaling (default `1.5x`), adjustable live.
 - **Native touch support**: full `wl_touch` forwarding, tap-to-focus windows, status-bar touch controls, and `Mod + Touch` window dragging.
 - **Built-in PAM lock screen**: `Mod + Shift + l` (or `Mod + Ctrl + l` / `kill -USR2`) locks the session with a full-screen purple PAM locker.
@@ -28,7 +28,7 @@ sudo ./install-session.sh
 
 Then pick **purpwm** on the login screen. Quit with **`Mod + Shift + q`**.
 
-`Mod` is **Super** or **Alt**. Tapping `Mod` alone opens the launcher; `Mod + Return` opens a terminal.
+`Mod` is **Super** or **Alt**. Press **`Mod + h`** anytime to bring up the keybinding cheat sheet; tapping `Mod` alone opens the launcher; `Mod + Return` opens a terminal.
 
 ## Documentation
 

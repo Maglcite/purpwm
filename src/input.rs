@@ -1,7 +1,8 @@
 //! Keyboard, pointer, and touch input handling for `purpwm`, including:
+//! - `Mod + h` keybinding cheat sheet overlay (closed with `Mod + h`, `Escape`, or any click / tap)
 //! - Solo `Mod` tap detection (press and release `Mod` alone to launch `/home/mag/Documents/Spotlight`)
 //! - `Mod + Arrow` keys to move windows around (and `Mod + Shift + Arrow` to resize)
-//! - Full `dwm` keybindings (`Mod + 1..9`, `Mod + j/k`, `Mod + h/l`, `Mod + Return`, etc.)
+//! - Full `dwm` keybindings (`Mod + 1..9`, `Mod + j/k`, `Mod + [/]`, `Mod + Return`, etc.)
 //! - Built-in PAM lock screen (`Mod + Shift + l` / `Mod + Ctrl + l` / `XF86ScreenSaver`)
 //! - Native Wayland touch input (`wl_touch`) with status bar taps, window focus, and `Mod + Touch` move
 //! - Wi-Fi (`Mod + w`, `Mod + Shift + w`) and Bluetooth (`Mod + Shift + b`) controls + clickable bar pills
@@ -46,6 +47,7 @@ const BTN_MIDDLE: u32 = 0x112;
 /// Compositor action triggered by a keybinding or solo-Mod release.
 #[derive(Debug, Clone, Copy)]
 pub enum KeyAction {
+    ToggleHelp,
     SpawnLauncher,
     SpawnTerminal,
     SpawnSystemMonitor,
@@ -199,6 +201,12 @@ impl PurpState {
                     return FilterResult::Forward;
                 }
 
+                // Pressing `Escape` while the keybinding cheat sheet is open dismisses it.
+                if app.help.visible && sym.raw() == keysyms::KEY_Escape && !is_mod_active(mods) {
+                    app.help.visible = false;
+                    return FilterResult::Intercept(None);
+                }
+
                 // 2. Global hardware media / brightness / screenshot / lock keys (work without Mod)
                 match sym.raw() {
                     keysyms::KEY_XF86AudioRaiseVolume => {
@@ -331,7 +339,9 @@ impl PurpState {
                     }
                     keysyms::KEY_j | keysyms::KEY_J => Some(KeyAction::FocusDelta(1)),
                     keysyms::KEY_k | keysyms::KEY_K => Some(KeyAction::FocusDelta(-1)),
-                    keysyms::KEY_h | keysyms::KEY_H => Some(KeyAction::AdjustMfact(-0.05)),
+                    keysyms::KEY_h | keysyms::KEY_H => Some(KeyAction::ToggleHelp),
+                    keysyms::KEY_bracketleft => Some(KeyAction::AdjustMfact(-0.05)),
+                    keysyms::KEY_bracketright => Some(KeyAction::AdjustMfact(0.05)),
                     keysyms::KEY_l | keysyms::KEY_L => {
                         if mods.shift || mods.ctrl {
                             Some(KeyAction::LockScreen)
@@ -422,6 +432,7 @@ impl PurpState {
 
     pub fn execute_key_action(&mut self, action: KeyAction) {
         match action {
+            KeyAction::ToggleHelp => self.help.toggle(),
             KeyAction::SpawnLauncher => self.spawn_launcher(),
             KeyAction::SpawnTerminal => self.spawn_terminal(),
             KeyAction::SpawnSystemMonitor => self.spawn_system_monitor(),
@@ -743,6 +754,10 @@ impl PurpState {
         if self.is_locked() {
             return;
         }
+        if state == ButtonState::Pressed && self.help.visible {
+            self.help.visible = false;
+            return;
+        }
 
         if state == ButtonState::Released
             && self.touch_grab_slot.is_none()
@@ -882,6 +897,10 @@ impl PurpState {
         self.pointer_location = pos;
 
         if self.is_locked() {
+            return;
+        }
+        if self.help.visible {
+            self.help.visible = false;
             return;
         }
 

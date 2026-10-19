@@ -6,12 +6,12 @@ compositor, or `gamescope` when started from a display manager) and composites i
 clients into that window with OpenGL ES.
 
 ```
-                ┌───────────────── main.rs: event loop ─────────────────┐
+                ┌───────────────── main.rs: event loop ──────────────────┐
  winit events ─▶│ keyboard / pointer / touch ─▶ input.rs ─▶ PurpState   │
  Wayland        │ clients ─▶ Display::dispatch_clients ─▶ state.rs      │
  clients        │ status / PAM / D-Bus threads ─▶ bar / lock / notify   │
                 │ (anything changed?) ─▶ render.rs ─▶ submit frame      │
-                └───────────────────────────────────────────────────────┘
+                └────────────────────────────────────────────────────────┘
 ```
 
 ## Source files
@@ -19,15 +19,17 @@ clients into that window with OpenGL ES.
 | File | Responsibility |
 | :--- | :--- |
 | `src/main.rs` | CLI, winit window, `wl_output`, main loop, damage-free redraw policy, screenshot capture, scale application |
-| `src/state.rs` | `PurpState`: protocol globals and handlers, focus, stacking order, hit-testing, popups, layer shell, touch/lock/notification integration, spawning commands, scale |
+| `src/state.rs` | `PurpState`: protocol globals and handlers, focus, stacking order, hit-testing, popups, layer shell, touch/lock/notification/help integration, spawning commands, scale |
 | `src/wm.rs` | dwm tiling engine: `ManagedWindow`, `Workspace`, per-tag state and the five layouts |
 | `src/input.rs` | Keybindings, solo-`Mod` tap, pointer motion / buttons / scroll, native `wl_touch` routing, status-bar clicks/taps, interactive move / resize |
+| `src/help.rs` | Built-in `Mod + h` keybinding cheat sheet overlay (`HelpOverlay`, multi-column software-rasterised panel) |
+| `src/cursor.rs` | System XCursor theme loader (`XCURSOR_THEME` / `XCURSOR_SIZE`) and scaled cursor rendering |
 | `src/lock.rs` | Built-in full-screen purple PAM screen locker (`LockScreen`, worker-thread PAM conversation) |
 | `src/notify.rs` | Built-in `org.freedesktop.Notifications` D-Bus listener and software-rasterised toast overlay (`NotificationCenter`) |
 | `src/render.rs` | Builds and draws render elements for one frame |
 | `src/bar.rs` | Software-rasterised status bar (`fontdue`), background status polling, cursor image |
 | `src/config.rs` | Compile-time configuration |
-| `src/tests.rs` | Unit tests for layouts, per-tag state, bar hit-testing, touch scaling, lock screen / PAM conversation, and notifications |
+| `src/tests.rs` | Unit tests for layouts, per-tag state, bar hit-testing, touch scaling, lock screen / PAM conversation, notifications, cursor loading, and help overlay |
 
 ## Wayland protocols
 
@@ -36,7 +38,7 @@ clients into that window with OpenGL ES.
 `xdg-decoration` (always server-side), `xdg-activation`, `wlr-layer-shell`,
 `wl_data_device` (clipboard and drag-and-drop with icon surfaces), `primary-selection`,
 `zwlr_data_control_manager_v1`, `zwp_idle_inhibit_manager_v1`, `viewporter`,
-`fractional-scale-v1` and `single-pixel-buffer`.
+`fractional-scale-v1`, `wp_cursor_shape_v1`, and `single-pixel-buffer`.
 
 ## Main loop
 
@@ -64,7 +66,7 @@ divided by `state.scale` and clamped to `output_size` via `touch_physical_to_log
 (bypassing Smithay's `WinitTouchStartedEvent::y_transformed`, which divides Y by width).
 
 Rendering converts to physical pixels: client surfaces are drawn with the output scale,
-borders are converted rectangle by rectangle, and the bar, lock screen, and notification
+borders are converted rectangle by rectangle, and the bar, lock screen, help overlay, and notification
 toasts are rasterised directly at physical resolution so text stays sharp.
 
 ## Windows, focus and stacking
@@ -77,7 +79,7 @@ truth for "what is on top" and is used by both rendering and pointer/touch hit-t
 3. Tiled windows (focused one first)
 
 Popups (menus, tooltips) are drawn above all windows and the bar; `Top` / `Overlay`
-layer-shell surfaces and desktop notification toasts sit above those. `Background` / `Bottom`
+layer-shell surfaces, desktop notification toasts, and the `Mod + h` help overlay sit above those. `Background` / `Bottom`
 layers sit under the windows.
 
 While `state.lock_screen` is `Some`, all keyboard, pointer, and touch focus is cleared from clients,

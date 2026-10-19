@@ -96,16 +96,17 @@ use smithay::{
 };
 
 use crate::{
-    cursor::CursorTheme,
     bar::StatusBar,
     config::{
-        AUTOSTART_COMMANDS, BAR_HEIGHT, BORDER_WIDTH, BLUETOOTH_COMMANDS, BRIGHTNESS_DOWN_COMMANDS,
+        AUTOSTART_COMMANDS, BAR_HEIGHT, BLUETOOTH_COMMANDS, BORDER_WIDTH, BRIGHTNESS_DOWN_COMMANDS,
         BRIGHTNESS_UP_COMMANDS, DEFAULT_SCALE, LAUNCHER_COMMANDS, MEDIA_NEXT_COMMANDS,
         MEDIA_PLAY_COMMANDS, MEDIA_PREV_COMMANDS, MIC_MUTE_COMMANDS, MIXER_COMMANDS, MOVE_STEP,
         POLKIT_COMMANDS, RESIZE_STEP, SCALE_MAX, SCALE_MIN, SCALE_STEP, SCREENSHOT_DIR,
         SYSTEM_MONITOR_COMMANDS, TAGMASK, TERMINAL_COMMANDS, VOL_DOWN_COMMANDS, VOL_MUTE_COMMANDS,
         VOL_UP_COMMANDS, WIFI_COMMANDS, WINDOW_RULES,
     },
+    cursor::CursorTheme,
+    help::HelpOverlay,
     lock::{LockPoll, LockScreen},
     notify::NotificationCenter,
     wm::{LayoutMode, ManagedWindow, Workspace},
@@ -301,10 +302,11 @@ pub struct PurpState {
     /// clients that pick their scale per output (GTK 3, ...) render sharply.
     pub output: Option<Output>,
 
-    // Built-in status bar, lock screen & notification center
+    // Built-in status bar, lock screen, notification center & keybinding cheat sheet
     pub bar: StatusBar,
     pub lock_screen: Option<LockScreen>,
     pub notifications: NotificationCenter,
+    pub help: HelpOverlay,
 }
 
 /// Convert physical window touch coordinates `(phys_x, phys_y)` into logical output coordinates
@@ -424,6 +426,7 @@ impl PurpState {
             bar,
             lock_screen: None,
             notifications,
+            help: HelpOverlay::default(),
         }
     }
 
@@ -442,6 +445,7 @@ impl PurpState {
         if self.lock_screen.is_some() {
             return;
         }
+        self.help.visible = false;
         self.active_grab = None;
         self.touch_grab_slot = None;
         self.touch_locations.clear();
@@ -996,7 +1000,6 @@ impl PurpState {
         w.geo = w.float_geo;
         self.relayout();
     }
-
 
     /// Toggle floating state on the currently focused window (`Mod + Shift + Space`).
     pub fn toggle_floating_focused(&mut self) {

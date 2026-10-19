@@ -6,6 +6,7 @@
 pub mod bar;
 pub mod config;
 pub mod cursor;
+pub mod help;
 pub mod input;
 pub mod lock;
 pub mod notify;
@@ -93,6 +94,7 @@ fn print_usage() {
          \x20 -h, --help         Show this help message\n\
          \n\
          KEYBINDINGS (Mod = Super/Logo or Alt):\n\
+         \x20 Mod + h            Show / hide keybinding cheat sheet overlay (Esc / click to close)\n\
          \x20 Tap Mod alone      Toggle Spotlight App Launcher (/home/mag/Documents/Spotlight)\n\
          \x20 Mod + p            Toggle Spotlight App Launcher (/home/mag/Documents/Spotlight)\n\
          \x20 Mod + Return       Open Terminal (alacritty / foot / kitty / etc.)\n\
@@ -105,7 +107,7 @@ fn print_usage() {
          \x20 Mod + Arrow Keys   Move focused window (swap in tiled mode, nudge in floating mode)\n\
          \x20 Mod + Shift+Arrows Resize focused floating window\n\
          \x20 Mod + j / k        Focus next / previous window\n\
-         \x20 Mod + h / l        Decrease / increase master width factor (mfact)\n\
+         \x20 Mod + [ / ] (or l) Decrease / increase master width factor (mfact)\n\
          \x20 Mod + i / d        Increase / decrease master window count (nmaster)\n\
          \x20 Mod + t / m / f    Switch layout: Tile ([]=), Monocle ([M]), Floating (><>)\n\
          \x20 Mod + u / g        Switch layout: CenteredMaster (|M|), Grid (###)\n\
