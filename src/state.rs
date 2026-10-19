@@ -22,6 +22,7 @@ use smithay::{
     delegate_idle_inhibit, delegate_layer_shell, delegate_output, delegate_primary_selection,
     delegate_seat, delegate_shm, delegate_single_pixel_buffer, delegate_viewporter,
     delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    output::Output,
     desktop::{
         find_popup_root_surface, get_popup_toplevel_coords, utils::under_from_surface_tree,
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy,
@@ -95,7 +96,7 @@ use smithay::{
 use crate::{
     bar::StatusBar,
     config::{
-        AUTOSTART_COMMANDS, BAR_HEIGHT, BLUETOOTH_COMMANDS, BRIGHTNESS_DOWN_COMMANDS,
+        AUTOSTART_COMMANDS, BAR_HEIGHT, BORDER_WIDTH, BLUETOOTH_COMMANDS, BRIGHTNESS_DOWN_COMMANDS,
         BRIGHTNESS_UP_COMMANDS, DEFAULT_SCALE, LAUNCHER_COMMANDS, MEDIA_NEXT_COMMANDS,
         MEDIA_PLAY_COMMANDS, MEDIA_PREV_COMMANDS, MIC_MUTE_COMMANDS, MIXER_COMMANDS, MOVE_STEP,
         POLKIT_COMMANDS, RESIZE_STEP, SCALE_MAX, SCALE_MIN, SCALE_STEP, SCREENSHOT_DIR,
@@ -289,6 +290,9 @@ pub struct PurpState {
 
     /// Output scale (logical -> physical pixels); see `config::DEFAULT_SCALE`.
     pub scale: f64,
+    /// The single `wl_output`; surfaces are told they are on it (`wl_surface.enter`) so
+    /// clients that pick their scale per output (GTK 3, ...) render sharply.
+    pub output: Option<Output>,
 
     // Built-in status bar, lock screen & notification center
     pub bar: StatusBar,
@@ -406,6 +410,7 @@ impl PurpState {
             screenshot_tx,
             screenshot_rx,
             scale: 1.0,
+            output: None,
             bar,
             lock_screen: None,
             notifications,
@@ -511,7 +516,8 @@ impl PurpState {
 
         // Evaluate compile-time `WINDOW_RULES` once a client sets its `app_id` or `title`
         let out_size = self.output_size;
-        for w in &mut self.windows {
+        let mut newly_floated = Vec::new();
+        for (idx, w) in self.windows.iter_mut().enumerate() {
             if !w.rules_applied {
                 let (app_id, title) = w.app_id_and_title();
                 if !app_id.is_empty() || !title.is_empty() {
@@ -528,14 +534,14 @@ impl PurpState {
                                 w.tags = rule.tags & TAGMASK;
                             }
                             if rule.is_floating {
+                                // Dialogs open at the size they ask for; until they draw,
+                                // reserve a centred default box.
                                 w.is_floating = true;
+                                w.size_from_client = true;
                                 let fw = 920.min(out_size.w - 48);
                                 let fh = 680.min(out_size.h - 64);
-                                w.float_geo = Rectangle::new(
-                                    Point::from(((out_size.w - fw) / 2, (out_size.h - fh) / 2)),
-                                    Size::from((fw, fh)),
-                                );
-                                w.geo = w.float_geo;
+                                w.float_geo.size = Size::from((fw, fh));
+                                newly_floated.push(idx);
                             }
                             if let Some(op) = rule.opacity {
                                 w.opacity_override = Some(op);
@@ -545,6 +551,14 @@ impl PurpState {
                     }
                 }
             }
+        }
+
+        for idx in newly_floated {
+            let size = self.windows[idx].float_geo.size;
+            let loc = self.cascade_loc(size, Some(idx));
+            let w = &mut self.windows[idx];
+            w.float_geo.loc = loc;
+            w.geo = w.float_geo;
         }
 
         if let Some(idx) = self.focused_idx {
@@ -780,8 +794,12 @@ impl PurpState {
             w.is_floating = true;
             w.float_geo = w.geo;
         }
-        w.float_geo.size.w = (w.float_geo.size.w + dw * RESIZE_STEP).max(120);
-        w.float_geo.size.h = (w.float_geo.size.h + dh * RESIZE_STEP).max(80);
+        w.size_from_client = false;
+        let wanted = Size::from((
+            (w.float_geo.size.w + dw * RESIZE_STEP).max(120),
+            (w.float_geo.size.h + dh * RESIZE_STEP).max(80),
+        ));
+        w.float_geo.size = w.clamp_frame_to_client_limits(wanted);
         w.geo = w.float_geo;
         self.relayout();
     }
@@ -876,9 +894,99 @@ impl PurpState {
 
     /// Set layout mode (`[]=`, `[M]`, `|M|`, `###`, `><>`).
     pub fn set_layout(&mut self, mode: LayoutMode) {
+        // Switching to `><>` leaves tiled windows where they are (like dwm) instead of
+        // piling them all onto their old default floating spot.
+        if mode == LayoutMode::Floating && self.workspace.layout() != LayoutMode::Floating {
+            let tags = self.workspace.selected_tags;
+            for w in &mut self.windows {
+                if w.is_visible_on(tags) && !w.is_floating && !w.is_scratchpad && !w.is_fullscreen {
+                    w.float_geo = w.geo;
+                }
+            }
+        }
         self.workspace.set_layout(mode);
         self.relayout();
     }
+
+    /// Top-left corner for a new floating window of `size`: centred below the bar, stepped
+    /// diagonally while another visible floating window already sits there, so floating
+    /// windows never hide each other completely.
+    pub fn cascade_loc(&self, size: Size<i32, Logical>, skip: Option<usize>) -> Point<i32, Logical> {
+        const STEP: i32 = 32;
+        let top = if self.workspace.show_bar { BAR_HEIGHT } else { 0 };
+        let out = self.output_size;
+        let start = Point::<i32, Logical>::from((
+            ((out.w - size.w) / 2).max(0),
+            (top + (out.h - top - size.h) / 2).max(top),
+        ));
+        let tags = self.workspace.selected_tags;
+        let taken = |p: Point<i32, Logical>| {
+            self.windows.iter().enumerate().any(|(i, w)| {
+                Some(i) != skip
+                    && (w.is_floating || w.is_scratchpad)
+                    && w.is_visible_on(tags)
+                    && (w.float_geo.loc.x - p.x).abs() < STEP / 2
+                    && (w.float_geo.loc.y - p.y).abs() < STEP / 2
+            })
+        };
+        let mut loc = start;
+        for step in 1..=12 {
+            if !taken(loc) {
+                return loc;
+            }
+            loc = Point::from((start.x + step * STEP, start.y + step * STEP));
+            if loc.x + size.w > out.w || loc.y + size.h > out.h {
+                // Ran off the screen: continue the cascade from the top-left instead.
+                loc = Point::from((STEP * step, top + STEP * step));
+            }
+        }
+        loc
+    }
+
+    /// For self-sizing floating windows, make the frame match what the client actually drew
+    /// (first time: also centre it). Runs on every commit of a toplevel.
+    fn adopt_client_size(&mut self, surface: &WlSurface) {
+        let Some(idx) = self.windows.iter().position(|w| w.wl_surface() == surface) else {
+            return;
+        };
+        let w = &self.windows[idx];
+        // Only once the client has acted on our "pick your own size" configure.
+        if !w.size_from_client
+            || !(w.is_floating || w.is_scratchpad)
+            || w.is_fullscreen
+            || w.toplevel.current_state().size.is_some()
+        {
+            return;
+        }
+        let Some(client) = w.client_geometry_size() else {
+            return;
+        };
+        let frame = Size::from((client.w + 2 * BORDER_WIDTH, client.h + 2 * BORDER_WIDTH));
+        if frame == w.float_geo.size && w.client_sized_once {
+            return;
+        }
+        let top = if self.workspace.show_bar { BAR_HEIGHT } else { 0 };
+        let limit: Size<i32, Logical> =
+            Size::from((self.output_size.w - 32, self.output_size.h - top - 32));
+        let clamped = Size::from((frame.w.min(limit.w), frame.h.min(limit.h)));
+        let first = !w.client_sized_once;
+        let loc = if first {
+            self.cascade_loc(clamped, Some(idx))
+        } else {
+            w.float_geo.loc
+        };
+
+        let w = &mut self.windows[idx];
+        w.client_sized_once = true;
+        // Too big for the screen: from now on we pick the (clamped) size.
+        if clamped != frame {
+            w.size_from_client = false;
+        }
+        w.float_geo = Rectangle::new(loc, clamped);
+        w.geo = w.float_geo;
+        self.relayout();
+    }
+
 
     /// Toggle floating state on the currently focused window (`Mod + Shift + Space`).
     pub fn toggle_floating_focused(&mut self) {
@@ -1572,7 +1680,11 @@ impl CompositorHandler for PurpState {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
-        // Tell new surfaces which scale to render at (no-op when already sent).
+        // Tell new surfaces which output they are on and which scale to render at
+        // (both are no-ops when already sent).
+        if let Some(output) = &self.output {
+            output.enter(surface);
+        }
         apply_preferred_scale(surface, self.scale);
 
         // Popups get their initial configure in response to their first commit.
@@ -1590,6 +1702,7 @@ impl CompositorHandler for PurpState {
         if needs_rule_check {
             self.relayout();
         }
+        self.adopt_client_size(surface);
 
         let mut is_layer = false;
         for layer in &mut self.layer_surfaces {
@@ -1819,6 +1932,8 @@ impl XdgShellHandler for PurpState {
             state.decoration_mode = Some(DecorationMode::ServerSide);
         });
         let mut win = ManagedWindow::new(surface, self.workspace.selected_tags, self.output_size);
+        win.float_geo.loc = self.cascade_loc(win.float_geo.size, None);
+        win.geo = win.float_geo;
         if self.pending_scratchpad_spawn {
             self.pending_scratchpad_spawn = false;
             win.is_scratchpad = true;

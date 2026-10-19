@@ -75,7 +75,10 @@ WindowRule {
 },
 ```
 
-A rule matches if **either** the `app_id` or the title substring matches. Find an app's
+A rule matches if **either** the `app_id` or the title substring matches. Windows floated by a
+rule open at the size the app asks for (the frame follows the app until you resize it
+yourself), and new floating windows are cascaded so they never sit exactly on top of
+each other. Find an app's
 `app_id` from its `.desktop` file name, or from the bar title while it is focused.
 
 Built-in rules float Spotlight, purpwm's own helper windows, polkit dialogs, file pickers,

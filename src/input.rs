@@ -21,7 +21,7 @@ use smithay::{
         pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
         touch::{DownEvent as TouchDown, MotionEvent as TouchMotion, UpEvent as TouchUp},
     },
-    utils::{Logical, Point, SERIAL_COUNTER},
+    utils::{Logical, Point, Size, SERIAL_COUNTER},
     wayland::{
         compositor::with_states,
         shell::wlr_layer::{KeyboardInteractivity, LayerSurfaceCachedState},
@@ -524,8 +524,13 @@ impl PurpState {
             w.float_geo.loc.x = start_geo.loc.x + dx;
             w.float_geo.loc.y = start_geo.loc.y + dy;
         } else {
-            w.float_geo.size.w = (start_geo.size.w + dx).max(120);
-            w.float_geo.size.h = (start_geo.size.h + dy).max(80);
+            // The user picked a size now; keep it within the app's min/max size hints.
+            w.size_from_client = false;
+            let wanted = Size::from((
+                (start_geo.size.w + dx).max(120),
+                (start_geo.size.h + dy).max(80),
+            ));
+            w.float_geo.size = w.clamp_frame_to_client_limits(wanted);
         }
         w.geo = w.float_geo;
         self.relayout();

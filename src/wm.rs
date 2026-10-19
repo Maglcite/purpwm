@@ -7,6 +7,7 @@ use smithay::{
         wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{Logical, Point, Rectangle, Size},
+    backend::renderer::utils::with_renderer_surface_state,
     wayland::{
         compositor::with_states,
         shell::xdg::{SurfaceCachedState, ToplevelSurface},
@@ -78,6 +79,11 @@ pub struct ManagedWindow {
     pub geo: Rectangle<i32, Logical>,
     /// Saved floating geometry restored when toggling floating or switching to `><>`.
     pub float_geo: Rectangle<i32, Logical>,
+    /// Floating window that picks its own size (dialogs floated by a rule): it is configured
+    /// without a size and the frame follows what the client draws, until the user resizes it.
+    pub size_from_client: bool,
+    /// Whether the client's own size has been adopted at least once (first time also centres it).
+    pub client_sized_once: bool,
 }
 
 impl ManagedWindow {
@@ -100,7 +106,36 @@ impl ManagedWindow {
             rules_applied: false,
             geo: float_geo,
             float_geo,
+            size_from_client: false,
+            client_sized_once: false,
         }
+    }
+
+    /// Size of the client's visible window (xdg window geometry, else its buffer), once mapped.
+    pub fn client_geometry_size(&self) -> Option<Size<i32, Logical>> {
+        let geometry = with_states(self.wl_surface(), |states| {
+            states.cached_state.get::<SurfaceCachedState>().current().geometry
+        });
+        geometry
+            .map(|g| g.size)
+            .or_else(|| with_renderer_surface_state(self.wl_surface(), |s| s.surface_size()).flatten())
+            .filter(|s| s.w > 0 && s.h > 0)
+    }
+
+    /// Clamp an outer frame size so the client area respects the client's min/max size hints.
+    pub fn clamp_frame_to_client_limits(&self, frame: Size<i32, Logical>) -> Size<i32, Logical> {
+        let (min, max) = with_states(self.wl_surface(), |states| {
+            let mut cached = states.cached_state.get::<SurfaceCachedState>();
+            let current = cached.current();
+            (current.min_size, current.max_size)
+        });
+        let clamp_axis = |v: i32, lo: i32, hi: i32| {
+            let inner = v - 2 * BORDER_WIDTH;
+            let inner = if hi > 0 { inner.min(hi) } else { inner };
+            let inner = if lo > 0 { inner.max(lo) } else { inner };
+            inner + 2 * BORDER_WIDTH
+        };
+        Size::from((clamp_axis(frame.w, min.w, max.w), clamp_axis(frame.h, min.h, max.h)))
     }
 
     #[inline]
@@ -192,8 +227,13 @@ impl ManagedWindow {
         let is_tiled =
             !self.is_floating && !self.is_fullscreen && !self.is_scratchpad && tiled_layout;
 
+        // Self-sizing floating windows get no size: the client picks its natural one.
+        let client_picks_size = self.size_from_client
+            && (self.is_floating || self.is_scratchpad)
+            && !self.is_fullscreen;
+
         self.toplevel.with_pending_state(|state| {
-            state.size = Some(size);
+            state.size = if client_picks_size { None } else { Some(size) };
             state.states.unset(xdg_toplevel::State::Activated);
             state.states.unset(xdg_toplevel::State::Fullscreen);
             state.states.unset(xdg_toplevel::State::TiledLeft);

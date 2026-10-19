@@ -292,6 +292,7 @@ pub fn run_winit(
 
     let mut state = PurpState::new(dh, socket_name.clone(), initial_logical, !is_standalone);
     state.set_scale(scale);
+    state.output = Some(output.clone());
     // Physical size and scale the wl_output / layout were last configured for.
     let mut applied_output = (initial_phys, scale);
 
