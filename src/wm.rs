@@ -7,7 +7,10 @@ use smithay::{
         wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{Logical, Point, Rectangle, Size},
-    wayland::{compositor::with_states, shell::xdg::ToplevelSurface},
+    wayland::{
+        compositor::with_states,
+        shell::xdg::{SurfaceCachedState, ToplevelSurface},
+    },
 };
 
 use crate::config::{
@@ -144,14 +147,30 @@ impl ManagedWindow {
         }
     }
 
-    /// Inner surface location (inside the 2px border).
+    /// Where the client's visible window geometry starts (inside the 2px border).
     #[inline]
-    pub fn surface_loc(&self) -> Point<i32, Logical> {
+    pub fn content_loc(&self) -> Point<i32, Logical> {
         if self.is_fullscreen {
             self.geo.loc
         } else {
             Point::from((self.geo.loc.x + BORDER_WIDTH, self.geo.loc.y + BORDER_WIDTH))
         }
+    }
+
+    /// Buffer origin of the toplevel surface. Clients drawing client-side shadows (GTK)
+    /// set a window geometry offset, so the buffer starts before the visible content.
+    #[inline]
+    pub fn surface_loc(&self) -> Point<i32, Logical> {
+        let geometry_offset = with_states(self.wl_surface(), |states| {
+            states
+                .cached_state
+                .get::<SurfaceCachedState>()
+                .current()
+                .geometry
+                .map(|g| g.loc)
+                .unwrap_or_default()
+        });
+        self.content_loc() - geometry_offset
     }
 
     /// Inner surface size (excluding 2*BORDER_WIDTH).
@@ -541,6 +560,11 @@ impl Workspace {
         let tiled_layout = layout != LayoutMode::Floating;
         for (idx, w) in windows.iter_mut().enumerate() {
             if !w.is_visible_on(self.selected_tags) {
+                // Windows on hidden tags must not keep looking focused (blinking cursors, etc.)
+                w.toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Activated);
+                });
+                w.toplevel.send_pending_configure();
                 continue;
             }
             if w.is_fullscreen {

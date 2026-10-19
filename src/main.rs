@@ -12,18 +12,29 @@ pub mod state;
 mod tests;
 pub mod wm;
 
-use std::{fs, sync::Arc, time::Instant};
+use std::{
+    fs,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use smithay::{
     backend::{
+        allocator::Fourcc,
         input::{
             AbsolutePositionEvent, ButtonState, Event, InputEvent, KeyboardKeyEvent,
             PointerButtonEvent, PointerMotionEvent,
         },
-        renderer::gles::GlesRenderer,
+        renderer::{
+            gles::{GlesError, GlesMapping, GlesRenderer, GlesTarget},
+            ExportMem, Texture,
+        },
         winit::{self, WinitEvent, WinitInput},
     },
-    output::{Mode, Output, PhysicalProperties, Subpixel},
+    output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         wayland_server::{Display, ListeningSocket},
         winit::{
@@ -32,12 +43,12 @@ use smithay::{
             window::{Fullscreen, Window as WinitWindow},
         },
     },
-    utils::{Rectangle, Size, Transform},
+    utils::{Buffer, Logical, Physical, Rectangle, Size, Transform},
 };
 
 use crate::{
     render::render_output_frame,
-    state::{send_frames_surface_tree, ClientState, PurpState},
+    state::{initial_scale, send_frames_surface_tree, ClientState, PurpState, ScreenshotRequest},
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,10 +65,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let spawn_initial_terminal = args.iter().any(|a| a == "--spawn-terminal");
+    let no_autostart = args.iter().any(|a| a == "--no-autostart");
     let is_standalone = args.iter().any(|a| a == "--standalone" || a == "--fullscreen")
         || std::env::var_os("PURPWM_STANDALONE").is_some();
 
-    run_winit(spawn_initial_terminal, is_standalone)
+    run_winit(spawn_initial_terminal, is_standalone, no_autostart)
 }
 
 fn print_usage() {
@@ -71,6 +83,7 @@ fn print_usage() {
          \x20 --standalone       Run fullscreen at native DRM panel resolution (used by COSMIC greeter)\n\
          \x20 --winit            Run nested inside an existing Wayland/X11 session\n\
          \x20 --spawn-terminal   Automatically launch a terminal on startup\n\
+         \x20 --no-autostart     Skip Spotlight daemon, polkit agent, radios & autostart (nested testing)\n\
          \x20 -h, --help         Show this help message\n\
          \n\
          KEYBINDINGS (Mod = Super/Logo or Alt):\n\
@@ -93,11 +106,16 @@ fn print_usage() {
          \x20 Mod + o            Toggle 100% Opaque mode on focused window (for video/media)\n\
          \x20 Mod + = / -        Increase / decrease vanity gaps on the fly\n\
          \x20 Mod + Shift + g    Toggle vanity gaps on/off\n\
+         \x20 Mod + Ctrl + = / - Bigger / smaller UI scale (saved; PURPWM_SCALE env overrides)\n\
          \x20 Mod + Ctrl + 0     Reset vanity gaps to default\n\
          \x20 Mod + Shift+Space  Toggle floating on focused window\n\
          \x20 Mod + b            Toggle top status bar visibility\n\
          \x20 Mod + 1..9         Switch to workspace tag 1..9 (per-tag layouts & mfact)\n\
          \x20 Mod + Shift + 1..9 Move focused window to workspace tag 1..9\n\
+         \x20 Mod + Escape       Open System Monitor (or click CPU/MEM area in top bar)\n\
+         \x20 Print              Screenshot to ~/Pictures/Screenshots + clipboard (kill -USR1 too)\n\
+         \x20 Shift/Mod + Print  Screenshot of the focused window only\n\
+         \x20 VOL pill           Click: mute | Scroll: volume | Right-click: mixer\n\
          \x20 Mod + Shift + c    Close focused window\n\
          \x20 Mod + Shift + q    Quit purpwm",
         env!("CARGO_PKG_VERSION")
@@ -134,9 +152,71 @@ pub fn detect_preferred_resolution() -> (u32, u32) {
     (2560, 1600)
 }
 
+/// Logical (layout) size of the output for a physical window size at `scale`.
+fn logical_output_size(physical: Size<i32, Physical>, scale: f64) -> Size<i32, Logical> {
+    let logical = physical.to_f64().to_logical(scale).to_i32_round::<i32>();
+    Size::from((logical.w.max(320), logical.h.max(240)))
+}
+
+static SCREENSHOT_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_screenshot_signal(_: libc::c_int) {
+    SCREENSHOT_SIGNAL.store(true, Ordering::Relaxed);
+}
+
+/// Start reading back the finished frame (or the requested window region) into a GPU buffer.
+/// Must run before `submit()`; the pixels are fetched afterwards by [`finish_capture`].
+fn start_capture(
+    renderer: &mut GlesRenderer,
+    framebuffer: &GlesTarget<'_>,
+    size: Size<i32, Physical>,
+    scale: f64,
+    request: ScreenshotRequest,
+) -> Result<GlesMapping, GlesError> {
+    let full = Rectangle::<i32, Physical>::from_size(size);
+    let region = match request {
+        ScreenshotRequest::Screen => full,
+        ScreenshotRequest::Region(geo) => geo
+            .to_physical_precise_round(scale)
+            .intersection(full)
+            .unwrap_or(full),
+    };
+    // The frame is rendered `Flipped180` into a bottom-up GL framebuffer, so the
+    // window's rows sit mirrored vertically in buffer space.
+    let buffer_region = Rectangle::<i32, Buffer>::new(
+        (region.loc.x, size.h - region.loc.y - region.size.h).into(),
+        (region.size.w, region.size.h).into(),
+    );
+    renderer.copy_framebuffer(framebuffer, buffer_region, Fourcc::Abgr8888)
+}
+
+/// Map a capture started by [`start_capture`] into tightly packed, top-down, opaque RGBA rows.
+/// Mapping makes the GL context current without the window surface, so this has to run
+/// after `submit()` (the next `bind()` restores the surface).
+fn finish_capture(
+    renderer: &mut GlesRenderer,
+    mapping: &GlesMapping,
+) -> Result<(u32, u32, Vec<u8>), GlesError> {
+    let size = mapping.size();
+    let pixels = renderer.map_texture(mapping)?;
+
+    let (w, h) = (size.w as usize, size.h as usize);
+    let stride = w * 4;
+    let mut rgba = Vec::with_capacity(stride * h);
+    for row in (0..h).rev() {
+        rgba.extend_from_slice(&pixels[row * stride..(row + 1) * stride]);
+    }
+    // The purple backdrop is translucent; screenshots should look like the screen does.
+    for px in rgba.as_chunks_mut::<4>().0 {
+        px[3] = 255;
+    }
+    Ok((w as u32, h as u32, rgba))
+}
+
 pub fn run_winit(
     spawn_initial_terminal: bool,
     is_standalone: bool,
+    no_autostart: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut display: Display<PurpState> = Display::new()?;
     let dh = display.handle();
@@ -173,10 +253,8 @@ pub fn run_winit(
     backend.window().set_cursor_visible(false);
 
     let initial_phys = backend.window_size();
-    let initial_logical = Size::from((
-        initial_phys.w.max(native_w as i32 / 2),
-        initial_phys.h.max(native_h as i32 / 2),
-    ));
+    let scale = initial_scale();
+    let initial_logical = logical_output_size(initial_phys, scale);
 
     // Register a Wayland wl_output global so clients (including Spotlight's zxdg_output_v1 probe)
     // know our exact resolution & refresh rate.
@@ -197,26 +275,40 @@ pub fn run_winit(
     output.change_current_state(
         Some(mode),
         Some(Transform::Flipped180),
-        None,
+        Some(Scale::Fractional(scale)),
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
 
     let mut state = PurpState::new(dh, socket_name.clone(), initial_logical, !is_standalone);
+    state.set_scale(scale);
+    // Physical size and scale the wl_output / layout were last configured for.
+    let mut applied_output = (initial_phys, scale);
 
     tracing::info!(
-        "purpwm listening on WAYLAND_DISPLAY={} ({}x{}, standalone={})",
+        "purpwm listening on WAYLAND_DISPLAY={} ({}x{} @ {}x scale, standalone={})",
         socket_name,
-        initial_logical.w,
-        initial_logical.h,
+        initial_phys.w,
+        initial_phys.h,
+        scale,
         is_standalone
     );
 
     // Ensure Wi-Fi and Bluetooth are enabled & connected, pre-warm Spotlight daemon, and run autostart
-    state.ensure_network_and_bluetooth();
-    state.spawn_spotlight_daemon();
-    state.run_autostart();
-    state.spawn_polkit_agent();
+    if !no_autostart {
+        state.ensure_network_and_bluetooth();
+        state.spawn_spotlight_daemon();
+        state.run_autostart();
+        state.spawn_polkit_agent();
+    }
+
+    // `kill -USR1 <pid>` takes a screenshot (scriptable, no extra protocol needed)
+    unsafe {
+        libc::signal(
+            libc::SIGUSR1,
+            on_screenshot_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+    }
 
     if spawn_initial_terminal {
         state.spawn_terminal();
@@ -231,19 +323,8 @@ pub fn run_winit(
         let pump_status = winit_evt_loop.dispatch_new_events(|event| {
             had_winit_events = true;
             match event {
-                WinitEvent::Resized { size, .. } => {
-                    state.output_size = Size::from((size.w.max(320), size.h.max(240)));
-                    output.change_current_state(
-                        Some(Mode {
-                            size,
-                            refresh: 120_000,
-                        }),
-                        Some(Transform::Flipped180),
-                        None,
-                        Some((0, 0).into()),
-                    );
-                    state.relayout();
-                }
+                // Size changes are applied before the next frame (see `applied_output`).
+                WinitEvent::Resized { .. } => {}
                 WinitEvent::CloseRequested => {
                     state.should_quit = true;
                 }
@@ -296,6 +377,13 @@ pub fn run_winit(
         }
 
         let dispatched = display.dispatch_clients(&mut state)?;
+
+        if SCREENSHOT_SIGNAL.swap(false, Ordering::Relaxed) {
+            state.request_screenshot(false);
+        }
+        while let Ok(png_bytes) = state.screenshot_rx.try_recv() {
+            state.offer_screenshot_clipboard(png_bytes);
+        }
         display.flush_clients()?;
 
         let status_changed = state.bar.tick_status();
@@ -306,20 +394,31 @@ pub fn run_winit(
             || status_changed
             || state.bar.is_dirty()
             || state.active_grab.is_some()
+            || state.screenshot_request.is_some()
         {
             needs_render = true;
         }
 
         if needs_render {
             let phys_size = backend.window_size();
-            if phys_size.w > 0
-                && phys_size.h > 0
-                && phys_size != state.output_size.to_physical(1)
-            {
-                state.output_size = Size::from((phys_size.w, phys_size.h));
+            if phys_size.w > 0 && phys_size.h > 0 && (phys_size, state.scale) != applied_output {
+                applied_output = (phys_size, state.scale);
+                let mode = Mode {
+                    size: phys_size,
+                    refresh: 120_000,
+                };
+                output.change_current_state(
+                    Some(mode),
+                    Some(Transform::Flipped180),
+                    Some(Scale::Fractional(state.scale)),
+                    Some((0, 0).into()),
+                );
+                output.set_preferred(mode);
+                state.output_size = logical_output_size(phys_size, state.scale);
                 state.relayout();
             }
             let full_damage = Rectangle::from_size(phys_size);
+            let mut pending_capture = None;
 
             {
                 let (renderer, mut framebuffer) = backend.bind()?;
@@ -330,16 +429,23 @@ pub fn run_winit(
                     phys_size,
                     Transform::Flipped180,
                 )?;
+                if let Some(request) = state.screenshot_request.take() {
+                    match start_capture(renderer, &framebuffer, phys_size, state.scale, request) {
+                        Ok(mapping) => pending_capture = Some(mapping),
+                        Err(err) => tracing::warn!("Screenshot capture failed: {}", err),
+                    }
+                }
             }
 
+            // Only visible surfaces get frame callbacks, so clients on hidden tags stop
+            // redrawing (and stop waking the compositor) until they are shown again.
             let elapsed_ms = start_time.elapsed().as_millis() as u32;
-            for win in &state.windows {
+            let tags = state.workspace.selected_tags;
+            for win in state.windows.iter().filter(|w| w.is_visible_on(tags)) {
                 send_frames_surface_tree(win.wl_surface(), elapsed_ms);
             }
-            for popup in &state.popups {
-                if popup.alive() {
-                    send_frames_surface_tree(popup.wl_surface(), elapsed_ms);
-                }
+            for (popup, _) in state.visible_popups() {
+                send_frames_surface_tree(popup.wl_surface(), elapsed_ms);
             }
             for layer in &state.layer_surfaces {
                 if layer.surface.alive() {
@@ -349,6 +455,13 @@ pub fn run_winit(
 
             backend.submit(Some(&[full_damage]))?;
             needs_render = false;
+
+            if let Some(mapping) = pending_capture.take() {
+                match finish_capture(backend.renderer(), &mapping) {
+                    Ok((w, h, rgba)) => state.save_screenshot(w, h, rgba),
+                    Err(err) => tracing::warn!("Screenshot capture failed: {}", err),
+                }
+            }
         } else {
             // Idle throttling: sleep 8ms (~120Hz polling) when nothing changed,
             // dropping CPU usage to ~0% and preventing allocator churn.

@@ -5,8 +5,19 @@
 
 use smithay::backend::renderer::Color32F;
 
-/// Height of the built-in top status bar in logical pixels (`34px` for crisp HiDPI / 2560x1600 legibility).
-pub const BAR_HEIGHT: i32 = 34;
+/// Default output scale (HiDPI). `1.0` = native panel pixels; `1.5` makes everything 50% bigger
+/// while staying sharp (apps render at the higher resolution). Change it live with
+/// `Mod + Ctrl + =` / `Mod + Ctrl + -` (remembered in `~/.config/purpwm/scale`), or override a
+/// single launch with `PURPWM_SCALE=1.75`.
+pub const DEFAULT_SCALE: f64 = 1.5;
+
+/// Step and bounds for the runtime scale keybindings.
+pub const SCALE_STEP: f64 = 0.25;
+pub const SCALE_MIN: f64 = 1.0;
+pub const SCALE_MAX: f64 = 3.0;
+
+/// Height of the built-in top status bar in logical pixels (multiplied by the output scale).
+pub const BAR_HEIGHT: i32 = 28;
 
 /// Width of window borders in logical pixels (`dwm`-style `borderpx`).
 pub const BORDER_WIDTH: i32 = 2;
@@ -86,8 +97,8 @@ pub const TAG_NAMES: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 /// Mask covering all 9 tags (`0b1_1111_1111`).
 pub const TAGMASK: u16 = (1 << TAG_NAMES.len()) - 1;
 
-/// Font size in pixels for the built-in status bar (`16.5px` for crisp HiDPI legibility).
-pub const BAR_FONT_SIZE: f32 = 16.5;
+/// Font size of the built-in status bar in logical pixels (multiplied by the output scale).
+pub const BAR_FONT_SIZE: f32 = 13.5;
 
 /// Candidate system monospace TTF fonts loaded at startup for the built-in status bar.
 pub const FONT_PATHS: &[&str] = &[
@@ -372,10 +383,13 @@ pub const MEDIA_NEXT_COMMANDS: &[&[&str]] = &[&["playerctl", "next"]];
 /// Media previous track commands (`XF86AudioPrev`).
 pub const MEDIA_PREV_COMMANDS: &[&[&str]] = &[&["playerctl", "previous"]];
 
-/// Screenshot commands (`Print` or `Mod + Print`).
-pub const SCREENSHOT_COMMANDS: &[&[&str]] = &[&["grim"]];
+/// Built-in screenshots (`Print` = whole screen, `Shift/Mod + Print` = focused window) are saved
+/// under `$HOME/<SCREENSHOT_DIR>` and also offered on the clipboard as `image/png`.
+pub const SCREENSHOT_DIR: &str = "Pictures/Screenshots";
 
-/// Optional background daemons to autostart when `purpwm` launches (notification daemons, wallpaper, etc.).
+/// Audio mixer commands tried in order when right-clicking the `VOL` status bar pill.
+pub const MIXER_COMMANDS: &[&[&str]] = &[&["pavucontrol"], &["cosmic-settings", "sound"]];
+
 /// Polkit authentication agent commands tried in order.
 pub const POLKIT_COMMANDS: &[&[&str]] = &[
     &["/usr/local/bin/purpwm-polkit-agent"],

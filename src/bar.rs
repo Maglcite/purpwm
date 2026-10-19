@@ -1,12 +1,12 @@
 //! Built-in `dwm`-style translucent purple status bar rendered with `fontdue` into a
-//! cached `MemoryRenderBuffer` (re-rasterized only when state changes), with an
-//! O(1) pre-rasterized ASCII glyph cache, non-blocking Wi-Fi & Bluetooth status pills,
-//! direct Linux `/proc` parsing (no external subprocesses), and a high-visibility cursor texture.
+//! cached `MemoryRenderBuffer` (re-rasterized only when its inputs change), with a
+//! glyph cache, non-blocking Wi-Fi / Bluetooth / volume status pills,
+//! direct Linux `/proc` parsing for metrics, and a high-visibility cursor texture.
 
 use std::{
     collections::HashMap,
     fs,
-    process::Command,
+    process::{Command, Output, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -46,6 +46,8 @@ pub enum BarClickAction {
     Wifi,
     /// Clicked on the Bluetooth status pill (`[ BT: ... ]`).
     Bluetooth,
+    /// Clicked on the volume pill (`[ VOL 45% ]`).
+    Volume,
     /// Clicked on the right-aligned System Metrics area (CPU / MEM / BAT / Clock).
     SystemMonitor,
     /// Clicked on the window title area.
@@ -58,8 +60,24 @@ struct SystemStatusSnapshot {
     wifi_connected: bool,
     bt_label: String,
     bt_active: bool,
+    volume_label: String,
+    volume_unmuted: bool,
     sys_metrics: String,
 }
+
+/// Everything the bar draws besides the status snapshot; a redraw happens only when this changes.
+#[derive(Clone, PartialEq)]
+struct BarInputs {
+    selected_tags: u16,
+    occupied_tags: u16,
+    focused_tags: u16,
+    urgent_tags: u16,
+    layout: LayoutMode,
+    focused_title: String,
+}
+
+/// Upper bound for lazily rasterized non-ASCII glyphs (titles with CJK, emoji, dashes...).
+const GLYPH_CACHE_LIMIT: usize = 1024;
 
 #[derive(Clone)]
 struct CachedGlyph {
@@ -75,14 +93,19 @@ pub struct StatusBar {
     cursor_buffer: MemoryRenderBuffer,
     width: i32,
     height: i32,
+    /// Output scale: the bar is rasterized in physical pixels so text stays crisp.
+    scale: f64,
+    font_px: f32,
     dirty: bool,
     last_status_check: Instant,
     shared_status: Arc<Mutex<SystemStatusSnapshot>>,
     current_status: SystemStatusSnapshot,
+    last_inputs: Option<BarInputs>,
     tag_cell_width: i32,
     layout_cell_end: i32,
     wifi_pill_range: (i32, i32),
     bt_pill_range: (i32, i32),
+    vol_pill_range: (i32, i32),
     metrics_range: (i32, i32),
 }
 
@@ -91,16 +114,7 @@ impl StatusBar {
         let width = initial_width.max(320);
         let height = BAR_HEIGHT;
         let font = Self::load_system_font();
-        let mut glyph_cache = HashMap::with_capacity(128);
-
-        // Pre-rasterize printable ASCII characters (`32..=126`) at startup for O(1) bar redraws
-        if let Some(ref f) = font {
-            for b in 32u8..=126u8 {
-                let ch = b as char;
-                let (metrics, bitmap) = f.rasterize(ch, BAR_FONT_SIZE);
-                glyph_cache.insert(ch, CachedGlyph { metrics, bitmap });
-            }
-        }
+        let glyph_cache = HashMap::with_capacity(128);
 
         let buffer = MemoryRenderBuffer::new(
             Fourcc::Argb8888,
@@ -117,38 +131,75 @@ impl StatusBar {
             wifi_connected: false,
             bt_label: "BT: ...".to_string(),
             bt_active: false,
+            volume_label: "VOL ...".to_string(),
+            volume_unmuted: false,
             sys_metrics: Self::collect_fast_metrics(),
         };
         let shared_status = Arc::new(Mutex::new(initial_snapshot.clone()));
 
-        // Spawn a background daemon thread to poll Wi-Fi (nmcli), Bluetooth (bluetoothctl),
-        // battery, CPU, memory, and clock every 2 seconds without ever blocking the compositor frame loop.
+        // Background thread: battery, CPU, memory, volume and clock every 2 seconds; the
+        // radios (nmcli / bluetoothctl subprocesses) every 6 seconds. Never blocks the frame loop.
         let bg_shared = Arc::clone(&shared_status);
-        std::thread::spawn(move || loop {
-            let snap = Self::collect_full_snapshot();
-            if let Ok(mut guard) = bg_shared.lock() {
-                *guard = snap;
+        std::thread::spawn(move || {
+            let mut tick = 0u64;
+            loop {
+                let mut snap = bg_shared.lock().map(|g| g.clone()).unwrap_or_default();
+                if tick.is_multiple_of(3) {
+                    Self::refresh_radios(&mut snap);
+                }
+                Self::refresh_fast(&mut snap);
+                if let Ok(mut guard) = bg_shared.lock() {
+                    *guard = snap;
+                }
+                tick = tick.wrapping_add(1);
+                std::thread::sleep(Duration::from_secs(2));
             }
-            std::thread::sleep(Duration::from_secs(2));
         });
 
-        Self {
+        let mut bar = Self {
             font,
             glyph_cache,
             buffer,
             cursor_buffer,
             width,
             height,
+            scale: 1.0,
+            font_px: BAR_FONT_SIZE,
             dirty: true,
             last_status_check: Instant::now() - Duration::from_secs(10),
             shared_status,
             current_status: initial_snapshot,
+            last_inputs: None,
             tag_cell_width: 34,
             layout_cell_end: 34 * 9 + 52,
             wifi_pill_range: (0, 0),
             bt_pill_range: (0, 0),
+            vol_pill_range: (0, 0),
             metrics_range: (0, 0),
+        };
+        bar.cache_ascii_glyphs();
+        bar
+    }
+
+    /// Pre-rasterize printable ASCII (`32..=126`) at the current font size for O(1) redraws.
+    fn cache_ascii_glyphs(&mut self) {
+        let ascii: String = (32u8..=126u8).map(char::from).collect();
+        self.cache_glyphs(&ascii);
+    }
+
+    /// Re-rasterize the bar for a new output scale (bar height, font and spacing all scale).
+    pub fn set_scale(&mut self, scale: f64) {
+        if (scale - self.scale).abs() < f64::EPSILON {
+            return;
         }
+        self.scale = scale;
+        self.font_px = BAR_FONT_SIZE * scale as f32;
+        self.height = (BAR_HEIGHT as f64 * scale).round() as i32;
+        self.tag_cell_width = (34.0 * scale).round() as i32;
+        self.layout_cell_end = self.tag_cell_width * TAG_NAMES.len() as i32;
+        self.glyph_cache.clear();
+        self.cache_ascii_glyphs();
+        self.dirty = true;
     }
 
     fn create_purple_cursor_buffer() -> MemoryRenderBuffer {
@@ -252,12 +303,14 @@ impl StatusBar {
         self.dirty = true;
     }
 
-    /// Trigger an immediate asynchronous refresh of the Wi-Fi & Bluetooth status pills.
+    /// Trigger an immediate asynchronous refresh of the Wi-Fi, Bluetooth & volume pills.
     pub fn request_immediate_status_refresh(&mut self) {
         let bg_shared = Arc::clone(&self.shared_status);
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(350));
-            let snap = Self::collect_full_snapshot();
+            let mut snap = SystemStatusSnapshot::default();
+            Self::refresh_radios(&mut snap);
+            Self::refresh_fast(&mut snap);
             if let Ok(mut guard) = bg_shared.lock() {
                 *guard = snap;
             }
@@ -280,33 +333,50 @@ impl StatusBar {
         changed
     }
 
-    fn collect_full_snapshot() -> SystemStatusSnapshot {
-        let (wifi_label, wifi_connected) = Self::query_wifi_status();
-        let (bt_label, bt_active) = Self::query_bluetooth_status();
-        let sys_metrics = Self::collect_fast_metrics();
-        SystemStatusSnapshot {
-            wifi_label,
-            wifi_connected,
-            bt_label,
-            bt_active,
-            sys_metrics,
+    /// Wi-Fi & Bluetooth pills (subprocess-backed, so polled less often).
+    fn refresh_radios(snap: &mut SystemStatusSnapshot) {
+        (snap.wifi_label, snap.wifi_connected) = Self::query_wifi_status();
+        (snap.bt_label, snap.bt_active) = Self::query_bluetooth_status();
+    }
+
+    /// Volume pill and `/proc` / `/sys` metrics.
+    fn refresh_fast(snap: &mut SystemStatusSnapshot) {
+        (snap.volume_label, snap.volume_unmuted) = Self::query_volume();
+        snap.sys_metrics = Self::collect_fast_metrics();
+    }
+
+    fn query_volume() -> (String, bool) {
+        // `wpctl get-volume` prints e.g. `Volume: 0.45` or `Volume: 0.45 [MUTED]`
+        let Some(out) = command_output_timeout("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"])
+        else {
+            return ("VOL N/A".to_string(), false);
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let Some(level) = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|v| v.parse::<f64>().ok())
+        else {
+            return ("VOL N/A".to_string(), false);
+        };
+        let percent = (level * 100.0).round() as i64;
+        if text.contains("[MUTED]") {
+            (format!("VOL Mute {}%", percent), false)
+        } else {
+            (format!("VOL {}%", percent), true)
         }
     }
 
     fn query_wifi_status() -> (String, bool) {
         // Fast direct sysfs check for rfkill state
-        let rfkill_blocked = fs::read_to_string("/sys/class/rfkill/rfkill1/soft")
-            .or_else(|_| fs::read_to_string("/sys/class/rfkill/rfkill3/soft"))
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false);
-        if rfkill_blocked {
+        if rfkill_soft_blocked("wlan") {
             return ("WIFI: Off".to_string(), false);
         }
 
-        if let Ok(out) = Command::new("nmcli")
-            .args(["-t", "-f", "TYPE,STATE,CONNECTION", "device", "status"])
-            .output()
-        {
+        if let Some(out) = command_output_timeout(
+            "nmcli",
+            &["-t", "-f", "TYPE,STATE,CONNECTION", "device", "status"],
+        ) {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines() {
                 let mut parts = line.splitn(3, ':');
@@ -329,15 +399,12 @@ impl StatusBar {
     }
 
     fn query_bluetooth_status() -> (String, bool) {
-        let bt_blocked = fs::read_to_string("/sys/class/rfkill/rfkill0/soft")
-            .or_else(|_| fs::read_to_string("/sys/class/rfkill/rfkill2/soft"))
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false);
-        if bt_blocked {
+        if rfkill_soft_blocked("bluetooth") {
             return ("BT: Off".to_string(), false);
         }
 
-        let Ok(show_out) = Command::new("bluetoothctl").arg("show").output() else {
+        // `bluetoothctl` waits forever when bluetoothd is down, hence the timeout.
+        let Some(show_out) = command_output_timeout("bluetoothctl", &["show"]) else {
             return ("BT: N/A".to_string(), false);
         };
         let show_txt = String::from_utf8_lossy(&show_out.stdout);
@@ -348,10 +415,7 @@ impl StatusBar {
             return ("BT: Off".to_string(), false);
         }
 
-        if let Ok(conn_out) = Command::new("bluetoothctl")
-            .args(["devices", "Connected"])
-            .output()
-        {
+        if let Some(conn_out) = command_output_timeout("bluetoothctl", &["devices", "Connected"]) {
             let conn_txt = String::from_utf8_lossy(&conn_out.stdout);
             if let Some(first_line) = conn_txt.lines().next() {
                 let mut parts = first_line.splitn(3, ' ');
@@ -369,11 +433,10 @@ impl StatusBar {
     }
 
     fn collect_fast_metrics() -> String {
-        // 1. Direct /proc/loadavg read
-        let load = fs::read_to_string("/proc/loadavg")
-            .ok()
-            .and_then(|s| s.split_whitespace().next().map(String::from))
-            .unwrap_or_else(|| "0.00".to_string());
+        // 1. CPU utilisation since the previous sample, from /proc/stat
+        let cpu = cpu_usage_percent()
+            .map(|p| format!("{:>2}%", p))
+            .unwrap_or_else(|| "--%".to_string());
 
         // 2. Direct /proc/meminfo read
         let mem_str = fs::read_to_string("/proc/meminfo")
@@ -423,7 +486,7 @@ impl StatusBar {
         // 4. Local wall-clock time via libc::localtime_r
         let clock = Self::format_local_time();
 
-        format!("{}CPU {}  |  MEM {}  |  {}", bat_prefix, load, mem_str, clock)
+        format!("{}CPU {}  |  MEM {}  |  {}", bat_prefix, cpu, mem_str, clock)
     }
 
     fn format_local_time() -> String {
@@ -446,7 +509,9 @@ impl StatusBar {
     }
 
     /// Map an X coordinate (on the bar) to a clickable bar region.
+    /// `x` is in logical coordinates (like the pointer); the bar itself is laid out in pixels.
     pub fn hit_test(&self, x: i32) -> BarClickAction {
+        let x = (x as f64 * self.scale) as i32;
         let tags_total_w = self.tag_cell_width * TAG_NAMES.len() as i32;
         if x >= 0 && x < tags_total_w {
             let idx = (x / self.tag_cell_width) as usize;
@@ -466,6 +531,12 @@ impl StatusBar {
             && x < self.bt_pill_range.1
         {
             return BarClickAction::Bluetooth;
+        }
+        if self.vol_pill_range.1 > self.vol_pill_range.0
+            && x >= self.vol_pill_range.0
+            && x < self.vol_pill_range.1
+        {
+            return BarClickAction::Volume;
         }
         if self.metrics_range.1 > self.metrics_range.0
             && x >= self.metrics_range.0
@@ -501,6 +572,21 @@ impl StatusBar {
 
         self.tick_status();
 
+        // Client commits trigger frames constantly (video, animations); only re-rasterize
+        // the bar when something it shows actually changed.
+        let inputs = BarInputs {
+            selected_tags,
+            occupied_tags,
+            focused_tags,
+            urgent_tags,
+            layout,
+            focused_title: focused_title.to_string(),
+        };
+        if self.last_inputs.as_ref() != Some(&inputs) {
+            self.last_inputs = Some(inputs);
+            self.dirty = true;
+        }
+
         if self.dirty {
             self.redraw_software_buffer(
                 selected_tags,
@@ -535,16 +621,29 @@ impl StatusBar {
         layout: LayoutMode,
         focused_title: &str,
     ) {
+        let snap = self.current_status.clone();
+        for text in [
+            focused_title,
+            &snap.wifi_label,
+            &snap.bt_label,
+            &snap.volume_label,
+        ] {
+            self.cache_glyphs(text);
+        }
+
         let w = self.width;
         let h = self.height;
+        let font_px = self.font_px;
+        let scale = self.scale;
+        let px = |v: i32| ((v as f64) * scale).round() as i32;
         let font_ref = self.font.as_ref();
         let glyph_cache = &self.glyph_cache;
-        let snap = self.current_status.clone();
         let tag_w = self.tag_cell_width;
-        let text_y = ((h - BAR_FONT_SIZE as i32) / 2).max(4);
+        let text_y = ((h - font_px as i32) / 2).max(px(4));
         let mut layout_end_out = self.layout_cell_end;
         let mut wifi_range_out = (0, 0);
         let mut bt_range_out = (0, 0);
+        let mut vol_range_out = (0, 0);
         let mut metrics_range_out = (0, 0);
 
         let mut ctx = self.buffer.render();
@@ -580,12 +679,12 @@ impl StatusBar {
                         BAR_ACCENT_RGBA
                     };
                     if has_focused {
-                        fill_rect(buf, w, h, cur_x + 4, 4, 5, 5, sq_color);
+                        fill_rect(buf, w, h, cur_x + px(4), px(4), px(5), px(5), sq_color);
                     } else {
-                        fill_rect(buf, w, h, cur_x + 4, 4, 5, 1, sq_color);
-                        fill_rect(buf, w, h, cur_x + 4, 8, 5, 1, sq_color);
-                        fill_rect(buf, w, h, cur_x + 4, 4, 1, 5, sq_color);
-                        fill_rect(buf, w, h, cur_x + 8, 4, 1, 5, sq_color);
+                        fill_rect(buf, w, h, cur_x + px(4), px(4), px(5), px(1), sq_color);
+                        fill_rect(buf, w, h, cur_x + px(4), px(8), px(5), px(1), sq_color);
+                        fill_rect(buf, w, h, cur_x + px(4), px(4), px(1), px(5), sq_color);
+                        fill_rect(buf, w, h, cur_x + px(8), px(4), px(1), px(5), sq_color);
                     }
                 }
 
@@ -595,7 +694,7 @@ impl StatusBar {
                     BAR_TEXT_DIM_RGBA
                 };
 
-                let text_w = measure_text(font_ref, glyph_cache, label, BAR_FONT_SIZE);
+                let text_w = measure_text(font_ref, glyph_cache, label, font_px);
                 let tx = cur_x + (tag_w - text_w) / 2;
                 draw_text(
                     buf,
@@ -606,7 +705,7 @@ impl StatusBar {
                     label,
                     tx,
                     text_y,
-                    BAR_FONT_SIZE,
+                    font_px,
                     text_color,
                 );
 
@@ -615,7 +714,7 @@ impl StatusBar {
 
             // 4. Draw Layout indicator pill (`[]=`, `[M]`, `|M|`, `###`, `><>`)
             let sym = layout.symbol();
-            let sym_w = measure_text(font_ref, glyph_cache, sym, BAR_FONT_SIZE) + 20;
+            let sym_w = measure_text(font_ref, glyph_cache, sym, font_px) + px(20);
             fill_rect(buf, w, h, cur_x, 0, sym_w, h - 1, BAR_LAYOUT_BG_RGBA);
             draw_text(
                 buf,
@@ -624,9 +723,9 @@ impl StatusBar {
                 font_ref,
                 glyph_cache,
                 sym,
-                cur_x + 10,
+                cur_x + px(10),
                 text_y,
-                BAR_FONT_SIZE,
+                font_px,
                 BAR_ACCENT_RGBA,
             );
             cur_x += sym_w;
@@ -634,7 +733,7 @@ impl StatusBar {
 
             // 5. Right-aligned system metrics + Clickable Bluetooth Pill + Clickable Wi-Fi Pill
             let metrics_w =
-                measure_text(font_ref, glyph_cache, &snap.sys_metrics, BAR_FONT_SIZE) + 18;
+                measure_text(font_ref, glyph_cache, &snap.sys_metrics, font_px) + px(18);
             let mut right_cursor = w - metrics_w;
             draw_text(
                 buf,
@@ -643,18 +742,45 @@ impl StatusBar {
                 font_ref,
                 glyph_cache,
                 &snap.sys_metrics,
-                right_cursor + 6,
+                right_cursor + px(6),
                 text_y,
-                BAR_FONT_SIZE,
+                font_px,
                 BAR_TEXT_FG_RGBA,
             );
             metrics_range_out = (right_cursor, w);
 
+            // Volume clickable pill (`[ VOL 45% ]`): click mutes, scroll adjusts, right-click mixer
+            let vol_text_w =
+                measure_text(font_ref, glyph_cache, &snap.volume_label, font_px);
+            let vol_pill_w = vol_text_w + px(20);
+            right_cursor -= vol_pill_w + px(8);
+            if right_cursor > cur_x + px(40) {
+                let vol_fg = if snap.volume_unmuted {
+                    BAR_TEXT_FG_RGBA
+                } else {
+                    BAR_TEXT_DIM_RGBA
+                };
+                fill_rect(buf, w, h, right_cursor, px(3), vol_pill_w, h - px(7), BAR_LAYOUT_BG_RGBA);
+                draw_text(
+                    buf,
+                    w,
+                    h,
+                    font_ref,
+                    glyph_cache,
+                    &snap.volume_label,
+                    right_cursor + px(10),
+                    text_y,
+                    font_px,
+                    vol_fg,
+                );
+                vol_range_out = (right_cursor, right_cursor + vol_pill_w);
+            }
+
             // Bluetooth clickable pill (`[ BT: ... ]`)
-            let bt_text_w = measure_text(font_ref, glyph_cache, &snap.bt_label, BAR_FONT_SIZE);
-            let bt_pill_w = bt_text_w + 20;
-            right_cursor -= bt_pill_w + 8;
-            if right_cursor > cur_x + 40 {
+            let bt_text_w = measure_text(font_ref, glyph_cache, &snap.bt_label, font_px);
+            let bt_pill_w = bt_text_w + px(20);
+            right_cursor -= bt_pill_w + px(8);
+            if right_cursor > cur_x + px(40) {
                 let bt_bg = if snap.bt_active {
                     [0x4C, 0x1D, 0x95, 225]
                 } else {
@@ -665,7 +791,7 @@ impl StatusBar {
                 } else {
                     BAR_TEXT_DIM_RGBA
                 };
-                fill_rect(buf, w, h, right_cursor, 3, bt_pill_w, h - 7, bt_bg);
+                fill_rect(buf, w, h, right_cursor, px(3), bt_pill_w, h - px(7), bt_bg);
                 draw_text(
                     buf,
                     w,
@@ -673,9 +799,9 @@ impl StatusBar {
                     font_ref,
                     glyph_cache,
                     &snap.bt_label,
-                    right_cursor + 10,
+                    right_cursor + px(10),
                     text_y,
-                    BAR_FONT_SIZE,
+                    font_px,
                     bt_fg,
                 );
                 bt_range_out = (right_cursor, right_cursor + bt_pill_w);
@@ -683,10 +809,10 @@ impl StatusBar {
 
             // Wi-Fi clickable pill (`[ WIFI: ... ]`)
             let wifi_text_w =
-                measure_text(font_ref, glyph_cache, &snap.wifi_label, BAR_FONT_SIZE);
-            let wifi_pill_w = wifi_text_w + 20;
-            right_cursor -= wifi_pill_w + 8;
-            if right_cursor > cur_x + 40 {
+                measure_text(font_ref, glyph_cache, &snap.wifi_label, font_px);
+            let wifi_pill_w = wifi_text_w + px(20);
+            right_cursor -= wifi_pill_w + px(8);
+            if right_cursor > cur_x + px(40) {
                 let wifi_bg = if snap.wifi_connected {
                     BAR_TAG_ACTIVE_RGBA
                 } else {
@@ -697,7 +823,7 @@ impl StatusBar {
                 } else {
                     BAR_TEXT_DIM_RGBA
                 };
-                fill_rect(buf, w, h, right_cursor, 3, wifi_pill_w, h - 7, wifi_bg);
+                fill_rect(buf, w, h, right_cursor, px(3), wifi_pill_w, h - px(7), wifi_bg);
                 draw_text(
                     buf,
                     w,
@@ -705,22 +831,22 @@ impl StatusBar {
                     font_ref,
                     glyph_cache,
                     &snap.wifi_label,
-                    right_cursor + 10,
+                    right_cursor + px(10),
                     text_y,
-                    BAR_FONT_SIZE,
+                    font_px,
                     wifi_fg,
                 );
                 wifi_range_out = (right_cursor, right_cursor + wifi_pill_w);
             }
 
             // 6. Draw active window title in the middle section
-            let title_avail_w = (right_cursor - cur_x - 24).max(0);
-            if title_avail_w > 32 && !focused_title.is_empty() {
+            let title_avail_w = (right_cursor - cur_x - px(24)).max(0);
+            if title_avail_w > px(32) && !focused_title.is_empty() {
                 let clipped = clip_text_to_width(
                     font_ref,
                     glyph_cache,
                     focused_title,
-                    BAR_FONT_SIZE,
+                    font_px,
                     title_avail_w,
                 );
                 draw_text(
@@ -730,9 +856,9 @@ impl StatusBar {
                     font_ref,
                     glyph_cache,
                     &clipped,
-                    cur_x + 12,
+                    cur_x + px(12),
                     text_y,
-                    BAR_FONT_SIZE,
+                    font_px,
                     BAR_TEXT_FG_RGBA,
                 );
             }
@@ -745,8 +871,88 @@ impl StatusBar {
         self.layout_cell_end = layout_end_out;
         self.wifi_pill_range = wifi_range_out;
         self.bt_pill_range = bt_range_out;
+        self.vol_pill_range = vol_range_out;
         self.metrics_range = metrics_range_out;
     }
+
+    /// Rasterize any glyphs of `text` not cached yet, so bar redraws never re-rasterize.
+    fn cache_glyphs(&mut self, text: &str) {
+        let Some(font) = self.font.as_ref() else {
+            return;
+        };
+        let font_px = self.font_px;
+        for ch in text.chars() {
+            if self.glyph_cache.len() >= GLYPH_CACHE_LIMIT {
+                return;
+            }
+            self.glyph_cache.entry(ch).or_insert_with(|| {
+                let (metrics, bitmap) = font.rasterize(ch, font_px);
+                CachedGlyph { metrics, bitmap }
+            });
+        }
+    }
+}
+
+/// Whether any rfkill switch of `kind` (`wlan`, `bluetooth`) is soft-blocked.
+/// rfkill indices are assigned at boot, so match on the `type` file instead of the number.
+fn rfkill_soft_blocked(kind: &str) -> bool {
+    let Ok(entries) = fs::read_dir("/sys/class/rfkill") else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        fs::read_to_string(path.join("type")).is_ok_and(|t| t.trim() == kind)
+            && fs::read_to_string(path.join("soft")).is_ok_and(|s| s.trim() == "1")
+    })
+}
+
+/// Run a status command, giving up (and killing it) after 3 seconds.
+fn command_output_timeout(program: &str, args: &[&str]) -> Option<Output> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Busy CPU percentage across all cores since the previous call (`None` on the first sample).
+fn cpu_usage_percent() -> Option<u64> {
+    static PREV: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    let fields: Vec<u64> = stat
+        .lines()
+        .next()?
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    // user nice system idle iowait irq softirq steal
+    let idle = fields.get(3)? + fields.get(4).copied().unwrap_or(0);
+    let total: u64 = fields.iter().take(8).sum();
+
+    let mut prev = PREV.lock().ok()?;
+    let result = prev.and_then(|(prev_idle, prev_total)| {
+        let d_total = total.checked_sub(prev_total)?;
+        let d_idle = idle.checked_sub(prev_idle)?;
+        (d_total > 0).then(|| (d_total - d_idle.min(d_total)) * 100 / d_total)
+    });
+    *prev = Some((idle, total));
+    result
 }
 
 /// Write a premultiplied `Fourcc::Argb8888` pixel (little-endian `[B, G, R, A]`) into `buf`.

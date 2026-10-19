@@ -18,17 +18,20 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Polkit", "1.0")
 gi.require_version("PolkitAgent", "1.0")
 
-from gi.repository import GLib, Gio, Gtk, Polkit, PolkitAgent
+from gi.repository import GLib, Gio, GObject, Gtk, Polkit, PolkitAgent
 
 
 class PurpPolkitDialog(Gtk.Window):
-    def __init__(self, action_id, message, user_name, session, finish_cb):
+    def __init__(self, action_id, message, identity, cookie, finish_cb):
         super().__init__(title="Authentication Required — purpwm")
         self.set_default_size(440, 260)
         self.set_modal(True)
-        self.session = session
+        self.identity = identity
+        self.cookie = cookie
+        self.session = None
         self.finish_cb = finish_cb
         self.completed = False
+        self.cancelled = False
 
         # Apply translucent purple CSS styling
         css_provider = Gtk.CssProvider()
@@ -143,84 +146,187 @@ class PurpPolkitDialog(Gtk.Window):
         auth_btn.connect("clicked", self.on_authenticate)
         btn_box.append(auth_btn)
 
-        # Connect session signals
-        session.connect("request", self.on_session_request)
-        session.connect("show-error", self.on_session_error)
-        session.connect("show-info", self.on_session_info)
-        session.connect("completed", self.on_session_completed)
-
         self.connect("close-request", self.on_close_request)
+        self.start_session()
+
+    def start_session(self):
+        # A PolkitAgent.Session is single-use: a wrong password needs a fresh one to retry.
+        self.session = PolkitAgent.Session.new(self.identity, self.cookie)
+        self.session.connect("request", self.on_session_request)
+        self.session.connect("show-error", self.on_session_error)
+        self.session.connect("show-info", self.on_session_info)
+        self.session.connect("completed", self.on_session_completed)
+        self.session.initiate()
 
     def on_session_request(self, session, request, echo_on):
-        self.error_label.set_visible(False)
+        self.entry.grab_focus()
 
     def on_session_error(self, session, text):
-        self.error_label.set_text(text)
-        self.error_label.set_visible(True)
+        self.show_error(text)
 
     def on_session_info(self, session, text):
         pass
 
+    def show_error(self, text):
+        self.error_label.set_text(text)
+        self.error_label.set_visible(True)
+
     def on_session_completed(self, session, gained_authorization):
+        if self.completed:
+            return
+        if not gained_authorization and not self.cancelled:
+            self.show_error("Authentication failed — please try again.")
+            self.start_session()
+            return
+        self.finish(gained_authorization)
+
+    def finish(self, gained_authorization):
+        if self.completed:
+            return
         self.completed = True
-        self.finish_cb(gained_authorization)
+        self.finish_cb(gained_authorization, self.cancelled)
         self.destroy()
 
     def on_authenticate(self, widget):
         text = self.entry.get_text()
+        self.error_label.set_visible(False)
         self.session.response(text)
         self.entry.set_text("")
 
+    def cancel(self):
+        if self.completed:
+            return
+        self.cancelled = True
+        self.session.cancel()
+        self.finish(False)
+
     def on_cancel(self, widget):
-        if not self.completed:
-            self.session.cancel()
-            self.finish_cb(False)
-        self.destroy()
+        self.cancel()
 
     def on_close_request(self, window):
-        if not self.completed:
-            self.session.cancel()
-            self.finish_cb(False)
+        self.cancel()
         return False
 
 
-class PurpListener(PolkitAgent.Listener):
+AGENT_PATH = "/org/purpwm/PolicyKit1/AuthenticationAgent"
+
+# The authentication agent D-Bus interface polkitd calls into. It is implemented directly
+# instead of subclassing PolkitAgent.Listener: PyGObject drops the user_data pointer of
+# that vfunc's async callback, so completing a request from Python crashes libpolkit-agent.
+AGENT_INTROSPECTION = """
+<node>
+  <interface name="org.freedesktop.PolicyKit1.AuthenticationAgent">
+    <method name="BeginAuthentication">
+      <arg type="s" name="action_id" direction="in"/>
+      <arg type="s" name="message" direction="in"/>
+      <arg type="s" name="icon_name" direction="in"/>
+      <arg type="a{ss}" name="details" direction="in"/>
+      <arg type="s" name="cookie" direction="in"/>
+      <arg type="a(sa{sv})" name="identities" direction="in"/>
+    </method>
+    <method name="CancelAuthentication">
+      <arg type="s" name="cookie" direction="in"/>
+    </method>
+  </interface>
+</node>
+"""
+
+
+def identity_from_variant(kind, details):
+    if kind == "unix-user" and "uid" in details:
+        return Polkit.UnixUser.new(details["uid"])
+    if kind == "unix-group" and "gid" in details:
+        return Polkit.UnixGroup.new(details["gid"])
+    return None
+
+
+class PurpAgent:
     def __init__(self):
-        super().__init__()
+        self.dialogs = {}  # cookie -> PurpPolkitDialog
+        # GIO only caches the bus weakly: keep a reference or the connection (and with it
+        # our registration) is closed as soon as `register()` returns.
+        self.bus = None
 
-    def do_initiate_authentication(
-        self, action_id, message, icon_name, details, cookie, identities
-    ):
-        ident = identities[0] if identities else None
-        session = PolkitAgent.Session.new(ident, cookie)
+    def on_method_call(self, connection, sender, path, interface, method, params, invocation):
+        if method == "BeginAuthentication":
+            action_id, message, _icon, _details, cookie, raw_identities = params.unpack()
+            identities = [
+                i for i in (identity_from_variant(k, d) for k, d in raw_identities) if i is not None
+            ]
+            if not identities:
+                invocation.return_dbus_error(
+                    "org.freedesktop.PolicyKit1.Error.Failed", "No usable identity to authenticate as"
+                )
+                return
+            # Prefer authenticating as ourselves when we are one of the allowed identities.
+            uid = os.getuid()
+            ident = next(
+                (i for i in identities if isinstance(i, Polkit.UnixUser) and i.get_uid() == uid),
+                identities[0],
+            )
 
-        user_name = os.environ.get("USER", "root")
+            def finish_callback(gained, dialog_cancelled):
+                self.dialogs.pop(cookie, None)
+                if dialog_cancelled:
+                    invocation.return_dbus_error(
+                        "org.freedesktop.PolicyKit1.Error.Cancelled",
+                        "Authentication dialog was dismissed by the user",
+                    )
+                else:
+                    invocation.return_value(None)
 
-        def finish_callback(success):
-            self.initiate_authentication_finish(None)
-
-        def show_dialog():
-            win = PurpPolkitDialog(action_id, message, user_name, session, finish_callback)
+            win = PurpPolkitDialog(action_id, message, ident, cookie, finish_callback)
+            self.dialogs[cookie] = win
             win.present()
-            session.initiate()
+        elif method == "CancelAuthentication":
+            (cookie,) = params.unpack()
+            win = self.dialogs.get(cookie)
+            if win is None:
+                invocation.return_dbus_error(
+                    "org.freedesktop.PolicyKit1.Error.Failed", f"No pending authentication for {cookie}"
+                )
+                return
+            # polkit cancels when the requesting program goes away
+            win.cancel()
+            invocation.return_value(None)
 
-        GLib.idle_add(show_dialog)
+    def register(self):
+        self.bus = bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        node = Gio.DBusNodeInfo.new_for_xml(AGENT_INTROSPECTION)
+        bus.register_object(AGENT_PATH, node.interfaces[0], self.on_method_call, None, None)
+
+        try:
+            session_id = Polkit.UnixSession.new_for_process_sync(os.getpid(), None).get_session_id()
+        except Exception:
+            session_id = os.environ.get("XDG_SESSION_ID", "")
+        subject = ("unix-session", {"session-id": GLib.Variant("s", session_id)})
+        locale = os.environ.get("LANG", "en_US.UTF-8")
+        bus.call_sync(
+            "org.freedesktop.PolicyKit1",
+            "/org/freedesktop/PolicyKit1/Authority",
+            "org.freedesktop.PolicyKit1.Authority",
+            "RegisterAuthenticationAgent",
+            GLib.Variant("((sa{sv})ss)", (subject, locale, AGENT_PATH)),
+            None,
+            Gio.DBusCallFlags.NONE,
+            -1,
+            None,
+        )
 
 
 def main():
     app = Gtk.Application(application_id="org.purpwm.PolkitAuthenticationAgent")
 
     def on_activate(application):
-        listener = PurpListener()
+        # No window exists until a request arrives; without a hold the app would exit at once.
+        application.hold()
+        agent = PurpAgent()
+        application.agent = agent
         try:
-            subject = Polkit.UnixSession.new_for_process_sync(os.getpid(), None)
-        except Exception:
-            subject = Polkit.UnixProcess.new_for_pid(os.getpid())
-        try:
-            listener.register(PolkitAgent.RegisterFlags.NONE, subject, "/org/purpwm/PolicyKit1/AuthenticationAgent", None)
-            print("purpwm Polkit Authentication Agent successfully registered.")
+            agent.register()
+            print("purpwm Polkit Authentication Agent successfully registered.", flush=True)
         except Exception as e:
-            print(f"Polkit agent registration notice: {e}")
+            print(f"Polkit agent registration notice: {e}", flush=True)
 
     app.connect("activate", on_activate)
     # Run GLib main loop indefinitely

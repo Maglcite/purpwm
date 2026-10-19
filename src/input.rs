@@ -17,15 +17,22 @@ use smithay::{
         keyboard::{keysyms, FilterResult, Keysym, ModifiersState},
         pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
     },
-    utils::{Logical, Point, Serial},
+    utils::{Logical, Point, SERIAL_COUNTER},
+    wayland::{
+        compositor::with_states,
+        shell::wlr_layer::{KeyboardInteractivity, LayerSurfaceCachedState},
+    },
 };
 
 use crate::{
     bar::BarClickAction,
-    config::{BAR_HEIGHT, TAGMASK, TAG_NAMES},
+    config::{BAR_HEIGHT, SCALE_STEP, TAGMASK, TAG_NAMES},
     state::{InteractiveGrab, PurpState},
     wm::LayoutMode,
 };
+
+/// Scroll distance (one mouse-wheel notch) needed to switch tags from the status bar.
+const BAR_SCROLL_STEP: f64 = 15.0;
 
 /// Compositor action triggered by a keybinding or solo-Mod release.
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +53,7 @@ pub enum KeyAction {
     AdjustMfact(f32),
     AdjustNmaster(isize),
     AdjustGaps(i32),
+    AdjustScale(f64),
     ResetGaps,
     ToggleGaps,
     Zoom,
@@ -71,6 +79,7 @@ pub enum KeyAction {
     MediaNext,
     MediaPrev,
     Screenshot,
+    ScreenshotWindow,
 }
 
 #[inline]
@@ -87,12 +96,8 @@ fn is_mod_keysym(sym: Keysym) -> bool {
 }
 
 #[inline]
-fn is_mod_active(mods: &ModifiersState, is_nested: bool) -> bool {
-    if is_nested {
-        mods.alt || mods.logo
-    } else {
-        mods.logo || mods.alt
-    }
+fn is_mod_active(mods: &ModifiersState) -> bool {
+    mods.logo || mods.alt
 }
 
 /// Map a keysym (`1..9` or shifted `!..(`) to tag index `0..8`.
@@ -115,30 +120,28 @@ impl PurpState {
     /// Process a physical key press/release event through the Wayland seat keyboard.
     pub fn process_keyboard_event(&mut self, keycode: Keycode, state: KeyState, time: u32) {
         let keyboard = self.keyboard.clone();
-        let is_nested = self.is_nested;
+        let mut solo_mod_tap = false;
 
-        let action: Option<KeyAction> = keyboard
+        let intercepted: Option<Option<KeyAction>> = keyboard
             .input(
                 self,
                 keycode,
                 state,
-                Serial::from(0),
+                SERIAL_COUNTER.next_serial(),
                 time,
                 |app, mods, handle| {
                     app.modifiers = *mods;
                     let sym = handle.modified_sym();
 
-                    // 1. Solo-Mod tap detection:
+                    // 1. Solo-Mod tap detection. The Mod release is still forwarded so the
+                    //    focused client never believes Super/Alt is stuck down.
                     if is_mod_keysym(sym) {
                         match state {
                             KeyState::Pressed => {
                                 app.mod_tap_candidate = true;
                             }
                             KeyState::Released => {
-                                if app.mod_tap_candidate {
-                                    app.mod_tap_candidate = false;
-                                    return FilterResult::Intercept(Some(KeyAction::SpawnLauncher));
-                                }
+                                solo_mod_tap = std::mem::take(&mut app.mod_tap_candidate);
                             }
                         }
                         return FilterResult::Forward;
@@ -147,7 +150,14 @@ impl PurpState {
                     // Any non-Mod key press cancels the solo-Mod tap candidate.
                     if state == KeyState::Pressed {
                         app.mod_tap_candidate = false;
+                        // A fresh press decides again whether this key's release is swallowed.
+                        app.intercepted_keys.retain(|k| *k != keycode);
                     } else {
+                        // Swallow the release of keys whose press was a compositor binding.
+                        if let Some(pos) = app.intercepted_keys.iter().position(|k| *k == keycode) {
+                            app.intercepted_keys.swap_remove(pos);
+                            return FilterResult::Intercept(None);
+                        }
                         return FilterResult::Forward;
                     }
 
@@ -181,13 +191,18 @@ impl PurpState {
                             return FilterResult::Intercept(Some(KeyAction::MediaPrev));
                         }
                         keysyms::KEY_Print => {
-                            return FilterResult::Intercept(Some(KeyAction::Screenshot));
+                            let act = if mods.shift || is_mod_active(mods) {
+                                KeyAction::ScreenshotWindow
+                            } else {
+                                KeyAction::Screenshot
+                            };
+                            return FilterResult::Intercept(Some(act));
                         }
                         _ => {}
                     }
 
                     // 3. Check if Mod is held for compositor shortcuts.
-                    if !is_mod_active(mods, is_nested) {
+                    if !is_mod_active(mods) {
                         return FilterResult::Forward;
                     }
 
@@ -304,6 +319,12 @@ impl PurpState {
                         }
                         keysyms::KEY_F11 => Some(KeyAction::ToggleFullscreen),
                         keysyms::KEY_o | keysyms::KEY_O => Some(KeyAction::ToggleOpacity),
+                        keysyms::KEY_equal | keysyms::KEY_plus if mods.ctrl => {
+                            Some(KeyAction::AdjustScale(SCALE_STEP))
+                        }
+                        keysyms::KEY_minus | keysyms::KEY_underscore if mods.ctrl => {
+                            Some(KeyAction::AdjustScale(-SCALE_STEP))
+                        }
                         keysyms::KEY_equal | keysyms::KEY_plus => Some(KeyAction::AdjustGaps(2)),
                         keysyms::KEY_minus | keysyms::KEY_underscore => {
                             Some(KeyAction::AdjustGaps(-2))
@@ -340,11 +361,16 @@ impl PurpState {
                         FilterResult::Forward
                     }
                 },
-            )
-            .flatten();
+            );
 
-        if let Some(act) = action {
+        if state == KeyState::Pressed && intercepted.is_some() {
+            self.intercepted_keys.push(keycode);
+        }
+        if let Some(Some(act)) = intercepted {
             self.execute_key_action(act);
+        }
+        if solo_mod_tap {
+            self.spawn_launcher();
         }
     }
 
@@ -375,6 +401,7 @@ impl PurpState {
                 self.workspace.adjust_gaps(delta);
                 self.relayout();
             }
+            KeyAction::AdjustScale(delta) => self.adjust_scale(delta),
             KeyAction::ResetGaps => {
                 self.workspace.reset_gaps();
                 self.relayout();
@@ -417,7 +444,8 @@ impl PurpState {
             KeyAction::MediaPlay => self.spawn_media_play(),
             KeyAction::MediaNext => self.spawn_media_next(),
             KeyAction::MediaPrev => self.spawn_media_prev(),
-            KeyAction::Screenshot => self.spawn_screenshot(),
+            KeyAction::Screenshot => self.request_screenshot(false),
+            KeyAction::ScreenshotWindow => self.request_screenshot(true),
         }
     }
 
@@ -432,14 +460,7 @@ impl PurpState {
         let new_y = (self.pointer_location.y + delta.y).clamp(0.0, (self.output_size.h - 1) as f64);
         let new_pos = Point::from((new_x, new_y));
 
-        let under = if let Some((surf, loc)) = self.layer_surface_at(new_pos) {
-            Some((surf, loc.to_f64()))
-        } else {
-            self.window_at(new_pos).map(|(idx, surface_loc)| {
-                let surf = self.windows[idx].wl_surface().clone();
-                (surf, surface_loc.to_f64())
-            })
-        };
+        let under = self.surface_under(new_pos);
 
         let pointer = self.pointer.clone();
         pointer.relative_motion(
@@ -458,60 +479,67 @@ impl PurpState {
     pub fn process_pointer_motion(&mut self, position: Point<f64, Logical>, time: u32) {
         self.pointer_location = position;
 
-        if let Some(grab) = self.active_grab {
-            match grab {
+        if let Some(grab) = self.active_grab.clone() {
+            let (surface, start_pointer, start_geo, is_move) = match grab {
                 InteractiveGrab::Move {
-                    window_idx,
+                    surface,
                     start_pointer,
                     start_geo,
-                } => {
-                    if let Some(w) = self.windows.get_mut(window_idx) {
-                        let dx = (position.x - start_pointer.x).round() as i32;
-                        let dy = (position.y - start_pointer.y).round() as i32;
-                        w.float_geo.loc.x = start_geo.loc.x + dx;
-                        w.float_geo.loc.y = start_geo.loc.y + dy;
-                        w.geo = w.float_geo;
-                        self.relayout();
-                    }
-                }
+                } => (surface, start_pointer, start_geo, true),
                 InteractiveGrab::Resize {
-                    window_idx,
+                    surface,
                     start_pointer,
                     start_geo,
-                } => {
-                    if let Some(w) = self.windows.get_mut(window_idx) {
-                        let dw = (position.x - start_pointer.x).round() as i32;
-                        let dh = (position.y - start_pointer.y).round() as i32;
-                        w.float_geo.size.w = (start_geo.size.w + dw).max(120);
-                        w.float_geo.size.h = (start_geo.size.h + dh).max(80);
-                        w.geo = w.float_geo;
+                } => (surface, start_pointer, start_geo, false),
+            };
+            let Some(w) = self.windows.iter_mut().find(|w| w.wl_surface() == &surface) else {
+                // The dragged window closed mid-drag.
+                self.active_grab = None;
+                return;
+            };
+            let dx = (position.x - start_pointer.x).round() as i32;
+            let dy = (position.y - start_pointer.y).round() as i32;
+            if is_move {
+                w.float_geo.loc.x = start_geo.loc.x + dx;
+                w.float_geo.loc.y = start_geo.loc.y + dy;
+            } else {
+                w.float_geo.size.w = (start_geo.size.w + dx).max(120);
+                w.float_geo.size.h = (start_geo.size.h + dy).max(80);
+            }
+            w.geo = w.float_geo;
+            self.relayout();
+            return;
+        }
+
+        // Sloppy focus with dwm "enter" semantics: focus changes only when the pointer
+        // crosses into a different window, so a freshly opened window keeps focus until
+        // the mouse actually moves onto something else. Menus (popups) and button drags
+        // never move focus, otherwise a menu hanging over a neighbour would close.
+        if self.layer_surface_at(position).is_none()
+            && !self.pointer.is_grabbed()
+            && !self.popup_at(position)
+        {
+            let hovered = self.window_at(position).map(|(idx, _)| idx);
+            let hovered_surface = hovered.map(|idx| self.windows[idx].wl_surface().clone());
+            if hovered_surface != self.hovered_surface {
+                self.hovered_surface = hovered_surface;
+                if let Some(idx) = hovered {
+                    if self.focused_idx != Some(idx) {
+                        self.focused_idx = Some(idx);
                         self.relayout();
                     }
                 }
             }
-            return;
         }
 
-        let under = if let Some((surf, loc)) = self.layer_surface_at(position) {
-            Some((surf, loc.to_f64()))
-        } else {
-            self.window_at(position).map(|(idx, surface_loc)| {
-                if self.focused_idx != Some(idx) {
-                    self.focused_idx = Some(idx);
-                    self.relayout();
-                }
-                let surf = self.windows[idx].wl_surface().clone();
-                (surf, surface_loc.to_f64())
-            })
-        };
-
+        let under = self.surface_under(position);
         let pointer = self.pointer.clone();
         pointer.motion(
             self,
             under,
             &MotionEvent {
                 location: position,
-                serial: Serial::from(0),
+                serial: SERIAL_COUNTER.next_serial(),
                 time,
             },
         );
@@ -521,39 +549,57 @@ impl PurpState {
     /// Handle mouse wheel / touchpad two-finger scroll (`InputEvent::PointerAxis`).
     pub fn process_pointer_axis<B: InputBackend>(&mut self, event: B::PointerAxisEvent) {
         let pos = self.pointer_location;
+        // Mouse wheels only report discrete v120 steps; clients still need a continuous
+        // value (15 per notch, like libinput) or many of them ignore the scroll entirely.
+        let continuous = |axis| {
+            event
+                .amount(axis)
+                .unwrap_or_else(|| event.amount_v120(axis).unwrap_or(0.0) * 15.0 / 120.0)
+        };
 
-        // Scrolling on the top status bar switches workspace tags!
-        if self.workspace.show_bar
+        // Scrolling on the top status bar switches workspace tags (or volume over the VOL pill).
+        if self.bar_visible()
             && pos.y >= 0.0
             && pos.y < BAR_HEIGHT as f64
             && self.layer_surface_at(pos).is_none()
         {
-            let v = event
-                .amount(Axis::Vertical)
-                .or_else(|| event.amount_v120(Axis::Vertical))
-                .unwrap_or(0.0);
-            if v.abs() > 0.01 {
-                let ntags = TAG_NAMES.len() as isize;
-                let dir: isize = if v > 0.0 { 1 } else { -1 };
-                let next_tag = (self.workspace.cur_tag as isize + dir).rem_euclid(ntags) as usize;
-                self.view_tags(1u16 << next_tag);
+            self.bar_scroll_accum += continuous(Axis::Vertical);
+            while self.bar_scroll_accum.abs() >= BAR_SCROLL_STEP {
+                let dir: isize = if self.bar_scroll_accum > 0.0 { 1 } else { -1 };
+                self.bar_scroll_accum -= dir as f64 * BAR_SCROLL_STEP;
+                if self.bar.hit_test(pos.x as i32) == BarClickAction::Volume {
+                    if dir > 0 {
+                        self.spawn_volume_down();
+                    } else {
+                        self.spawn_volume_up();
+                    }
+                    self.bar.request_immediate_status_refresh();
+                } else {
+                    let ntags = TAG_NAMES.len() as isize;
+                    let next_tag =
+                        (self.workspace.cur_tag as isize + dir).rem_euclid(ntags) as usize;
+                    self.view_tags(1u16 << next_tag);
+                }
             }
             return;
         }
+        self.bar_scroll_accum = 0.0;
 
         let mut frame = AxisFrame::new(Event::time_msec(&event)).source(event.source());
         for axis in [Axis::Horizontal, Axis::Vertical] {
-            if let Some(amount) = event.amount(axis) {
-                if amount != 0.0 {
-                    frame = frame.value(axis, amount);
-                } else if matches!(event.source(), AxisSource::Finger | AxisSource::Continuous) {
-                    frame = frame.stop(axis);
+            let amount = continuous(axis);
+            if amount != 0.0 {
+                frame = frame
+                    .relative_direction(axis, event.relative_direction(axis))
+                    .value(axis, amount);
+                if let Some(v120) = event.amount_v120(axis) {
+                    frame = frame.v120(axis, v120 as i32);
                 }
+            } else if event.amount(axis) == Some(0.0)
+                && matches!(event.source(), AxisSource::Finger | AxisSource::Continuous)
+            {
+                frame = frame.stop(axis);
             }
-            if let Some(v120) = event.amount_v120(axis) {
-                frame = frame.v120(axis, v120 as i32);
-            }
-            frame = frame.relative_direction(axis, event.relative_direction(axis));
         }
 
         let pointer = self.pointer.clone();
@@ -577,18 +623,22 @@ impl PurpState {
         let pos = self.pointer_location;
 
         // 0. If clicking on a layer-shell overlay (Spotlight), forward directly to it
-        if self.layer_surface_at(pos).is_some() {
-            let pointer = self.pointer.clone();
-            pointer.button(
-                self,
-                &ButtonEvent {
-                    button,
-                    state,
-                    serial: Serial::from(0),
-                    time,
-                },
-            );
-            pointer.frame(self);
+        if let Some((layer_surface, _)) = self.layer_surface_at(pos) {
+            if state == ButtonState::Pressed {
+                let on_demand = with_states(&layer_surface, |states| {
+                    states
+                        .cached_state
+                        .get::<LayerSurfaceCachedState>()
+                        .current()
+                        .keyboard_interactivity
+                        == KeyboardInteractivity::OnDemand
+                });
+                if on_demand {
+                    self.layer_focus = Some(layer_surface);
+                    self.sync_keyboard_focus();
+                }
+            }
+            self.forward_pointer_button(button, state, time);
             return;
         }
 
@@ -596,9 +646,15 @@ impl PurpState {
         const BTN_RIGHT: u32 = 0x111;
         const BTN_MIDDLE: u32 = 0x112;
 
+        // Menus sit above everything: clicks on them go straight to the client.
+        if self.popup_at(pos) {
+            self.forward_pointer_button(button, state, time);
+            return;
+        }
+
         // 1. Check if clicking on the top status bar
         if state == ButtonState::Pressed
-            && self.workspace.show_bar
+            && self.bar_visible()
             && pos.y >= 0.0
             && pos.y < BAR_HEIGHT as f64
         {
@@ -636,6 +692,14 @@ impl PurpState {
                         self.spawn_bluetooth_manager();
                     }
                 }
+                BarClickAction::Volume => {
+                    if button == BTN_RIGHT {
+                        self.spawn_mixer();
+                    } else {
+                        self.spawn_volume_mute();
+                        self.bar.request_immediate_status_refresh();
+                    }
+                }
                 BarClickAction::SystemMonitor => {
                     self.spawn_system_monitor();
                 }
@@ -651,7 +715,7 @@ impl PurpState {
         }
 
         // 2. Check for `Mod + Left/Right/Middle Click` interactive window move/resize/toggle-float
-        if state == ButtonState::Pressed && is_mod_active(&self.modifiers, self.is_nested) {
+        if state == ButtonState::Pressed && is_mod_active(&self.modifiers) {
             if let Some((idx, _)) = self.window_at(pos) {
                 self.focused_idx = Some(idx);
                 if button == BTN_MIDDLE {
@@ -664,9 +728,10 @@ impl PurpState {
                     w.float_geo = w.geo;
                 }
                 let start_geo = w.float_geo;
+                let surface = w.wl_surface().clone();
                 if button == BTN_LEFT {
                     self.active_grab = Some(InteractiveGrab::Move {
-                        window_idx: idx,
+                        surface,
                         start_pointer: pos,
                         start_geo,
                     });
@@ -674,7 +739,7 @@ impl PurpState {
                     return;
                 } else if button == BTN_RIGHT {
                     self.active_grab = Some(InteractiveGrab::Resize {
-                        window_idx: idx,
+                        surface,
                         start_pointer: pos,
                         start_geo,
                     });
@@ -686,6 +751,7 @@ impl PurpState {
 
         // 3. Focus clicked window & forward button event to the Wayland client
         if state == ButtonState::Pressed {
+            self.layer_focus = None;
             if let Some((idx, _)) = self.window_at(pos) {
                 if self.focused_idx != Some(idx) {
                     self.focused_idx = Some(idx);
@@ -694,16 +760,25 @@ impl PurpState {
             }
         }
 
+        self.forward_pointer_button(button, state, time);
+    }
+
+    fn forward_pointer_button(&mut self, button: u32, state: ButtonState, time: u32) {
         let pointer = self.pointer.clone();
         pointer.button(
             self,
             &ButtonEvent {
                 button,
                 state,
-                serial: Serial::from(0),
+                serial: SERIAL_COUNTER.next_serial(),
                 time,
             },
         );
         pointer.frame(self);
+        // A click outside an open menu ends its grab; hand keyboard focus back to the
+        // window under the pointer instead of the menu's parent.
+        if state == ButtonState::Pressed {
+            self.sync_keyboard_focus();
+        }
     }
 }

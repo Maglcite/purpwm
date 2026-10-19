@@ -4,20 +4,30 @@
 //! `single-pixel-buffer`, `fractional-scale`, `xdg-activation`, scratchpad, and command spawning.
 
 use std::{
+    io::Write,
     os::unix::{io::OwnedFd, process::CommandExt},
     path::PathBuf,
     process::{Command, Stdio},
+    sync::{mpsc, Arc},
 };
 
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::{
+        input::Keycode,
+        renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
+    },
     delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_layer_shell,
     delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
     delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_activation,
     delegate_xdg_decoration, delegate_xdg_shell,
+    desktop::{
+        find_popup_root_surface, get_popup_toplevel_coords, utils::under_from_surface_tree,
+        PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy,
+        WindowSurfaceType,
+    },
     input::{
         keyboard::{KeyboardHandle, ModifiersState},
-        pointer::{CursorImageStatus, PointerHandle},
+        pointer::{CursorImageStatus, Focus, PointerHandle},
         Seat, SeatHandler, SeatState,
     },
     reexports::{
@@ -36,12 +46,12 @@ use smithay::{
             Client, DisplayHandle, Resource,
         },
     },
-    utils::{Logical, Point, Rectangle, Serial, Size},
+    utils::{IsAlive, Logical, Point, Rectangle, Serial, Size, Transform, SERIAL_COUNTER},
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
-            CompositorState, SurfaceAttributes, TraversalAction,
+            send_surface_state, with_states, with_surface_tree_downward, CompositorClientState,
+            CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
         },
         fractional_scale::{
             with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState,
@@ -49,13 +59,13 @@ use smithay::{
         output::{OutputHandler, OutputManagerState},
         selection::{
             data_device::{
-                set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
-                ServerDndGrabHandler,
+                set_data_device_focus, set_data_device_selection, ClientDndGrabHandler,
+                DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
             },
             primary_selection::{
                 set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
             },
-            SelectionHandler,
+            SelectionHandler, SelectionTarget,
         },
         shell::{
             wlr_layer::{
@@ -79,27 +89,36 @@ use smithay::{
 use crate::{
     bar::StatusBar,
     config::{
-        AUTOSTART_COMMANDS, BLUETOOTH_COMMANDS, BRIGHTNESS_DOWN_COMMANDS, BRIGHTNESS_UP_COMMANDS,
-        LAUNCHER_COMMANDS, MEDIA_NEXT_COMMANDS, MEDIA_PLAY_COMMANDS, MEDIA_PREV_COMMANDS,
-        MIC_MUTE_COMMANDS, MOVE_STEP, POLKIT_COMMANDS, RESIZE_STEP, SCREENSHOT_COMMANDS, SYSTEM_MONITOR_COMMANDS, TAGMASK, TERMINAL_COMMANDS,
+        AUTOSTART_COMMANDS, BAR_HEIGHT, DEFAULT_SCALE, SCALE_MAX, SCALE_MIN, SCALE_STEP, BLUETOOTH_COMMANDS, BRIGHTNESS_DOWN_COMMANDS,
+        BRIGHTNESS_UP_COMMANDS, LAUNCHER_COMMANDS, MEDIA_NEXT_COMMANDS, MEDIA_PLAY_COMMANDS,
+        MEDIA_PREV_COMMANDS, MIC_MUTE_COMMANDS, MIXER_COMMANDS, MOVE_STEP, POLKIT_COMMANDS,
+        RESIZE_STEP, SCREENSHOT_DIR, SYSTEM_MONITOR_COMMANDS, TAGMASK, TERMINAL_COMMANDS,
         VOL_DOWN_COMMANDS, VOL_MUTE_COMMANDS, VOL_UP_COMMANDS, WIFI_COMMANDS, WINDOW_RULES,
     },
     wm::{LayoutMode, ManagedWindow, Workspace},
 };
 
 /// Active mouse drag operation (`Mod + Left-Drag` to move, `Mod + Right-Drag` to resize).
-#[derive(Debug, Clone, Copy)]
+/// Tracks the window by surface because window indices shift when windows map or unmap.
+#[derive(Debug, Clone)]
 pub enum InteractiveGrab {
     Move {
-        window_idx: usize,
+        surface: WlSurface,
         start_pointer: Point<f64, Logical>,
         start_geo: Rectangle<i32, Logical>,
     },
     Resize {
-        window_idx: usize,
+        surface: WlSurface,
         start_pointer: Point<f64, Logical>,
         start_geo: Rectangle<i32, Logical>,
     },
+}
+
+/// Pending built-in screenshot (`Print` = whole screen, `Shift/Mod + Print` = focused window).
+#[derive(Debug, Clone, Copy)]
+pub enum ScreenshotRequest {
+    Screen,
+    Region(Rectangle<i32, Logical>),
 }
 
 /// Managed `wlr-layer-shell` surface (used by `Spotlight`'s centered overlay launcher).
@@ -117,13 +136,19 @@ impl ManagedLayerSurface {
             *states.cached_state.get::<LayerSurfaceCachedState>().current()
         });
 
+        // A zero size means "stretch between the anchored edges" (panels, wallpapers);
+        // unanchored zero-size surfaces keep the centered launcher fallback.
         let w = if state.size.w > 0 {
             state.size.w.min(output_size.w)
+        } else if state.anchor.contains(Anchor::LEFT | Anchor::RIGHT) {
+            (output_size.w - state.margin.left - state.margin.right).max(1)
         } else {
             740.min(output_size.w)
         };
         let h = if state.size.h > 0 {
             state.size.h.min(output_size.h)
+        } else if state.anchor.contains(Anchor::TOP | Anchor::BOTTOM) {
+            (output_size.h - state.margin.top - state.margin.bottom).max(1)
         } else {
             620.min(output_size.h)
         };
@@ -147,15 +172,25 @@ impl ManagedLayerSurface {
         self.geo = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
     }
 
+    /// `OnDemand` surfaces only get focus when clicked (see `layer_focus`), otherwise a
+    /// permanent panel would swallow all typing.
     pub fn wants_keyboard_focus(&self) -> bool {
         with_states(self.surface.wl_surface(), |states| {
             let mut binding = states.cached_state.get::<LayerSurfaceCachedState>();
             let cached = binding.current();
-            matches!(
-                cached.keyboard_interactivity,
-                KeyboardInteractivity::Exclusive | KeyboardInteractivity::OnDemand
-            )
+            cached.keyboard_interactivity == KeyboardInteractivity::Exclusive
         })
+    }
+
+    /// Whether the client has attached a buffer (unmapped surfaces must not take input).
+    pub fn is_mapped(&self) -> bool {
+        with_renderer_surface_state(self.surface.wl_surface(), |s| s.buffer().is_some())
+            .unwrap_or(false)
+    }
+
+    /// `Top` / `Overlay` layers render above windows; `Background` / `Bottom` below them.
+    pub fn is_above_windows(&self) -> bool {
+        matches!(self.layer, Layer::Top | Layer::Overlay)
     }
 }
 
@@ -208,15 +243,32 @@ pub struct PurpState {
     /// other key or mouse button is pressed while `Mod` is held. On `Mod` release,
     /// if still `true`, launches the `Spotlight` app launcher.
     pub mod_tap_candidate: bool,
+    /// Keys whose press triggered a compositor binding; their release is swallowed too.
+    pub intercepted_keys: Vec<Keycode>,
+    /// Window the pointer was last over (focus follows the pointer only when it enters a new window).
+    pub hovered_surface: Option<WlSurface>,
+    /// Accumulated scroll on the status bar so touchpads don't flick through every tag.
+    pub bar_scroll_accum: f64,
 
     // Window manager & workspace state
     pub output_size: Size<i32, Logical>,
     pub workspace: Workspace,
     pub windows: Vec<ManagedWindow>,
-    pub popups: Vec<PopupSurface>,
+    pub popup_manager: PopupManager,
     pub layer_surfaces: Vec<ManagedLayerSurface>,
+    /// `OnDemand` layer surface the user clicked into (keeps keyboard focus until a window is clicked).
+    pub layer_focus: Option<WlSurface>,
     pub focused_idx: Option<usize>,
     pub active_grab: Option<InteractiveGrab>,
+
+    // Built-in screenshots: request is served by the next rendered frame, the encoded PNG
+    // comes back from the encoder thread and is offered on the clipboard.
+    pub screenshot_request: Option<ScreenshotRequest>,
+    pub screenshot_tx: mpsc::Sender<Arc<Vec<u8>>>,
+    pub screenshot_rx: mpsc::Receiver<Arc<Vec<u8>>>,
+
+    /// Output scale (logical -> physical pixels); see `config::DEFAULT_SCALE`.
+    pub scale: f64,
 
     // Built-in status bar
     pub bar: StatusBar,
@@ -255,6 +307,7 @@ impl PurpState {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", uid)));
+        let (screenshot_tx, screenshot_rx) = mpsc::channel();
 
         Self {
             display_handle,
@@ -283,13 +336,21 @@ impl PurpState {
             cursor_status: CursorImageStatus::default_named(),
             modifiers: ModifiersState::default(),
             mod_tap_candidate: false,
+            intercepted_keys: Vec::new(),
+            hovered_surface: None,
+            bar_scroll_accum: 0.0,
             output_size,
             workspace: Workspace::default(),
             windows: Vec::new(),
-            popups: Vec::new(),
+            popup_manager: PopupManager::default(),
             layer_surfaces: Vec::new(),
+            layer_focus: None,
             focused_idx: None,
             active_grab: None,
+            screenshot_request: None,
+            screenshot_tx,
+            screenshot_rx,
+            scale: 1.0,
             bar,
         }
     }
@@ -299,8 +360,11 @@ impl PurpState {
     pub fn relayout(&mut self) {
         let prev_len = self.windows.len();
         self.windows.retain(|w| w.toplevel.alive());
-        self.popups.retain(|p| p.alive());
+        self.popup_manager.cleanup();
         self.layer_surfaces.retain(|l| l.surface.alive());
+        if self.layer_focus.as_ref().is_some_and(|s| !s.alive()) {
+            self.layer_focus = None;
+        }
 
         for layer in &mut self.layer_surfaces {
             layer.compute_geometry(self.output_size);
@@ -368,7 +432,6 @@ impl PurpState {
         self.workspace
             .arrange(&mut self.windows, self.focused_idx, self.output_size);
         self.sync_keyboard_focus();
-        self.bar.mark_dirty();
     }
 
     fn ensure_valid_focus(&mut self) {
@@ -381,26 +444,100 @@ impl PurpState {
     }
 
     pub fn sync_keyboard_focus(&mut self) {
-        if let Some(layer) = self
+        let layer_target = self
             .layer_surfaces
             .iter()
             .rev()
-            .find(|l| l.surface.alive() && l.wants_keyboard_focus())
-        {
-            let surf = layer.surface.wl_surface().clone();
-            let keyboard = self.keyboard.clone();
-            keyboard.set_focus(self, Some(surf), Serial::from(0));
-            return;
-        }
+            .find(|l| l.surface.alive() && l.is_mapped() && l.wants_keyboard_focus())
+            .map(|l| l.surface.wl_surface().clone())
+            .or_else(|| self.layer_focus.clone().filter(|s| s.alive()));
 
-        let target_surface = self
-            .focused_idx
-            .and_then(|idx| self.windows.get(idx))
-            .filter(|w| w.is_visible_on(self.workspace.selected_tags))
-            .map(|w| w.wl_surface().clone());
+        let target_surface = layer_target.or_else(|| {
+            self.focused_idx
+                .and_then(|idx| self.windows.get(idx))
+                .filter(|w| w.is_visible_on(self.workspace.selected_tags))
+                .map(|w| w.wl_surface().clone())
+        });
 
         let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, target_surface, Serial::from(0));
+        keyboard.set_focus(self, target_surface, SERIAL_COUNTER.next_serial());
+    }
+
+    /// Change the output scale by `delta` (`Mod + Ctrl + =` / `Mod + Ctrl + -`) and remember it.
+    /// The main loop picks up the new scale, updates the `wl_output` and relayouts.
+    pub fn adjust_scale(&mut self, delta: f64) {
+        let next = (((self.scale + delta) / SCALE_STEP).round() * SCALE_STEP).clamp(SCALE_MIN, SCALE_MAX);
+        if (next - self.scale).abs() < f64::EPSILON {
+            return;
+        }
+        self.set_scale(next);
+        if let Some(path) = scale_file_path() {
+            let _ = path
+                .parent()
+                .map(std::fs::create_dir_all)
+                .unwrap_or(Ok(()))
+                .and_then(|_| std::fs::write(&path, format!("{}\n", next)));
+        }
+    }
+
+    /// Apply `scale` to the bar and every existing surface.
+    pub fn set_scale(&mut self, scale: f64) {
+        self.scale = scale;
+        self.bar.set_scale(scale);
+        let mut roots: Vec<WlSurface> = self.windows.iter().map(|w| w.wl_surface().clone()).collect();
+        roots.extend(self.layer_surfaces.iter().map(|l| l.surface.wl_surface().clone()));
+        for w in &self.windows {
+            roots.extend(
+                PopupManager::popups_for_surface(w.wl_surface()).map(|(p, _)| p.wl_surface().clone()),
+            );
+        }
+        for root in roots {
+            with_surface_tree_downward(
+                &root,
+                (),
+                |_, _, &()| TraversalAction::DoChildren(()),
+                |surface, _, &()| apply_preferred_scale(surface, scale),
+                |_, _, &()| true,
+            );
+        }
+    }
+
+    /// Whether the status bar is drawn and clickable (hidden under a focused fullscreen window).
+    pub fn bar_visible(&self) -> bool {
+        self.workspace.show_bar
+            && !self
+                .focused_idx
+                .and_then(|idx| self.windows.get(idx))
+                .is_some_and(|w| w.is_fullscreen && w.is_visible_on(self.workspace.selected_tags))
+    }
+
+    /// Visible windows from topmost to bottommost. Rendering and hit-testing both use this,
+    /// so the window you see under the pointer is the one that gets the input:
+    /// focused fullscreen window, then floating windows, then tiled ones (focused first in each).
+    pub fn stacking_order(&self) -> Vec<usize> {
+        let tags = self.workspace.selected_tags;
+        let focused = self
+            .focused_idx
+            .filter(|&i| self.windows.get(i).is_some_and(|w| w.is_visible_on(tags)));
+        let floats = |w: &ManagedWindow| (w.is_floating || w.is_scratchpad) && !w.is_fullscreen;
+
+        let mut order = Vec::with_capacity(self.windows.len());
+        if let Some(f) = focused.filter(|&i| self.windows[i].is_fullscreen) {
+            order.push(f);
+        }
+        for pass_floating in [true, false] {
+            if let Some(f) =
+                focused.filter(|&i| !order.contains(&i) && floats(&self.windows[i]) == pass_floating)
+            {
+                order.push(f);
+            }
+            for (i, w) in self.windows.iter().enumerate() {
+                if Some(i) != focused && w.is_visible_on(tags) && floats(w) == pass_floating {
+                    order.push(i);
+                }
+            }
+        }
+        order
     }
 
     /// Focus next (`delta = 1`) or previous (`delta = -1`) visible window on current tags.
@@ -502,29 +639,37 @@ impl PurpState {
         self.relayout();
     }
 
-    /// Promote the focused window to the master slot (`dwm` `zoom()`).
+    /// Promote the focused window to the master slot (`dwm` `zoom()`); zooming the master
+    /// swaps it with the next tiled window. Floating windows are not part of the tile order.
     pub fn zoom_focused(&mut self) {
         let Some(focused) = self.focused_idx else {
             return;
         };
-        let first_tiled = self
+        let tags = self.workspace.selected_tags;
+        let is_tiled = |w: &ManagedWindow| {
+            w.is_visible_on(tags) && !w.is_floating && !w.is_fullscreen && !w.is_scratchpad
+        };
+        if !self.windows.get(focused).is_some_and(is_tiled) {
+            return;
+        }
+
+        let mut tiled = self
             .windows
             .iter()
             .enumerate()
-            .find(|(_, w)| {
-                w.is_visible_on(self.workspace.selected_tags)
-                    && !w.is_floating
-                    && !w.is_fullscreen
-                    && !w.is_scratchpad
-            })
+            .filter(|(_, w)| is_tiled(w))
             .map(|(i, _)| i);
+        let master = tiled.next();
+        let target = if master == Some(focused) {
+            tiled.next()
+        } else {
+            master
+        };
 
-        if let Some(master_idx) = first_tiled {
-            if master_idx != focused {
-                self.windows.swap(master_idx, focused);
-                self.focused_idx = Some(master_idx);
-                self.relayout();
-            }
+        if let Some(target) = target {
+            self.windows.swap(target, focused);
+            self.focused_idx = Some(target);
+            self.relayout();
         }
     }
 
@@ -620,7 +765,6 @@ impl PurpState {
                 } else {
                     w.opacity_override = Some(1.0);
                 }
-                self.bar.mark_dirty();
             }
         }
     }
@@ -645,8 +789,10 @@ impl PurpState {
             }
             self.relayout();
         } else {
-            self.pending_scratchpad_spawn = true;
-            self.spawn_terminal();
+            // Only arm the flag if a terminal actually launched, otherwise the next
+            // unrelated window would be swallowed as the scratchpad.
+            self.pending_scratchpad_spawn =
+                self.spawn_first_available(TERMINAL_COMMANDS, "scratchpad terminal");
         }
     }
 
@@ -809,12 +955,21 @@ impl PurpState {
         self.spawn_first_available(MIC_MUTE_COMMANDS, "mic mute");
     }
 
+    /// Open the audio mixer (Right-Click on the `VOL` status bar pill).
+    pub fn spawn_mixer(&self) {
+        self.spawn_first_available(MIXER_COMMANDS, "audio mixer");
+    }
+
     pub fn spawn_brightness_up(&self) {
-        self.spawn_first_available(BRIGHTNESS_UP_COMMANDS, "brightness up");
+        if !self.spawn_first_available(BRIGHTNESS_UP_COMMANDS, "brightness up") {
+            adjust_backlight_via_logind(5);
+        }
     }
 
     pub fn spawn_brightness_down(&self) {
-        self.spawn_first_available(BRIGHTNESS_DOWN_COMMANDS, "brightness down");
+        if !self.spawn_first_available(BRIGHTNESS_DOWN_COMMANDS, "brightness down") {
+            adjust_backlight_via_logind(-5);
+        }
     }
 
     pub fn spawn_media_play(&self) {
@@ -829,11 +984,63 @@ impl PurpState {
         self.spawn_first_available(MEDIA_PREV_COMMANDS, "media prev");
     }
 
-    pub fn spawn_screenshot(&self) {
-        self.spawn_first_available(SCREENSHOT_COMMANDS, "screenshot");
+    /// Capture the whole screen (`Print`) or just the focused window (`Shift/Mod + Print`)
+    /// on the next rendered frame. No `wlr-screencopy` / `grim` needed.
+    pub fn request_screenshot(&mut self, focused_window_only: bool) {
+        let window_geo = self
+            .focused_idx
+            .and_then(|idx| self.windows.get(idx))
+            .filter(|w| w.is_visible_on(self.workspace.selected_tags))
+            .map(|w| w.geo);
+        self.screenshot_request = match (focused_window_only, window_geo) {
+            (true, Some(geo)) => Some(ScreenshotRequest::Region(geo)),
+            _ => Some(ScreenshotRequest::Screen),
+        };
     }
 
-    fn spawn_first_available(&self, candidates: &[&[&str]], label: &str) {
+    /// Encode captured RGBA pixels to `~/Pictures/Screenshots/purpwm-<timestamp>.png` on a
+    /// background thread; the PNG is then handed back to be offered on the clipboard.
+    pub fn save_screenshot(&self, width: u32, height: u32, rgba: Vec<u8>) {
+        let dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(SCREENSHOT_DIR);
+        let tx = self.screenshot_tx.clone();
+        std::thread::spawn(move || {
+            let mut png_bytes = Vec::new();
+            let encoded = {
+                let mut encoder = png::Encoder::new(&mut png_bytes, width, height);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()
+                    .and_then(|mut writer| writer.write_image_data(&rgba))
+            };
+            if let Err(err) = encoded {
+                tracing::warn!("Failed to encode screenshot: {}", err);
+                return;
+            }
+            let path = dir.join(format!("purpwm-{}.png", screenshot_timestamp()));
+            match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &png_bytes)) {
+                Ok(()) => tracing::info!("Saved screenshot to {}", path.display()),
+                Err(err) => tracing::warn!("Failed to save screenshot {}: {}", path.display(), err),
+            }
+            let _ = tx.send(Arc::new(png_bytes));
+        });
+    }
+
+    /// Offer the latest screenshot PNG as the clipboard selection (`image/png`).
+    pub fn offer_screenshot_clipboard(&mut self, png_bytes: Arc<Vec<u8>>) {
+        set_data_device_selection(
+            &self.display_handle,
+            &self.seat,
+            vec!["image/png".to_string()],
+            png_bytes,
+        );
+    }
+
+    /// Returns `true` if one of the candidate commands was spawned.
+    fn spawn_first_available(&self, candidates: &[&[&str]], label: &str) -> bool {
         for cmd in candidates {
             if cmd.is_empty() {
                 continue;
@@ -842,10 +1049,11 @@ impl PurpState {
                 continue;
             }
             if self.spawn_detached_cmd(cmd, label) {
-                return;
+                return true;
             }
         }
         tracing::warn!("No available {} binary found in config candidates", label);
+        false
     }
 
     /// Spawn a child process in its own process group (`process_group(0)`) with a background reaper
@@ -895,14 +1103,18 @@ impl PurpState {
         }
     }
 
-    /// Check if `point` hits an active layer-shell surface (such as `Spotlight`) first.
+    /// Check if `point` hits a mapped `Top`/`Overlay` layer-shell surface (such as `Spotlight`).
     pub fn layer_surface_at(
         &self,
         point: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<i32, Logical>)> {
         let p = point.to_i32_round();
         for layer in self.layer_surfaces.iter().rev() {
-            if layer.surface.alive() && layer.geo.contains(p) {
+            if layer.surface.alive()
+                && layer.is_above_windows()
+                && layer.is_mapped()
+                && layer.geo.contains(p)
+            {
                 return Some((layer.surface.wl_surface().clone(), layer.geo.loc));
             }
         }
@@ -912,21 +1124,173 @@ impl PurpState {
     /// Find the topmost visible window at `point` (in logical coordinates).
     pub fn window_at(&self, point: Point<f64, Logical>) -> Option<(usize, Point<i32, Logical>)> {
         let p = point.to_i32_round();
-        for pass_floating in [true, false] {
-            for (idx, w) in self.windows.iter().enumerate().rev() {
-                if !w.is_visible_on(self.workspace.selected_tags) {
-                    continue;
-                }
-                let is_float_like = w.is_floating || w.is_scratchpad;
-                if is_float_like != pass_floating {
-                    continue;
-                }
-                if w.geo.contains(p) {
-                    return Some((idx, w.surface_loc()));
-                }
+        self.stacking_order()
+            .into_iter()
+            .find(|&idx| self.windows[idx].geo.contains(p))
+            .map(|idx| (idx, self.windows[idx].surface_loc()))
+    }
+
+    /// Popups of every visible window (topmost first) with their buffer origin in global coordinates.
+    pub fn visible_popups(&self) -> Vec<(PopupKind, Point<i32, Logical>)> {
+        let mut out = Vec::new();
+        for idx in self.stacking_order() {
+            let w = &self.windows[idx];
+            let content_loc = w.content_loc();
+            for (popup, offset) in PopupManager::popups_for_surface(w.wl_surface()) {
+                let loc = content_loc + offset - popup.geometry().loc;
+                out.push((popup, loc));
             }
         }
-        None
+        out
+    }
+
+    /// Whether `point` is over a visible popup (menu, dropdown, tooltip).
+    pub fn popup_at(&self, point: Point<f64, Logical>) -> bool {
+        self.visible_popups().into_iter().any(|(popup, loc)| {
+            under_from_surface_tree(popup.wl_surface(), point, loc, WindowSurfaceType::ALL)
+                .is_some()
+        })
+    }
+
+    /// Exact surface under `point` for pointer focus: overlays, then popup menus, then the
+    /// window's surface tree (subsurfaces respected), falling back to the toplevel itself
+    /// when the pointer is over its border.
+    pub fn surface_under(&self, point: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+        if let Some((surf, loc)) = self.layer_surface_at(point) {
+            return Some((surf, loc.to_f64()));
+        }
+        for (popup, loc) in self.visible_popups() {
+            if let Some((surf, surf_loc)) =
+                under_from_surface_tree(popup.wl_surface(), point, loc, WindowSurfaceType::ALL)
+            {
+                return Some((surf, surf_loc.to_f64()));
+            }
+        }
+        self.window_at(point).map(|(idx, surface_loc)| {
+            let root = self.windows[idx].wl_surface();
+            under_from_surface_tree(root, point, surface_loc, WindowSurfaceType::ALL)
+                .map(|(surf, loc)| (surf, loc.to_f64()))
+                .unwrap_or_else(|| (root.clone(), surface_loc.to_f64()))
+        })
+    }
+
+    /// Clamp a new or repositioned popup to the visible output area below the status bar.
+    fn unconstrain_popup(&self, popup: &PopupSurface) {
+        let kind = PopupKind::Xdg(popup.clone());
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+        let root_loc = if let Some(w) = self.windows.iter().find(|w| w.wl_surface() == &root) {
+            w.content_loc()
+        } else if let Some(l) = self
+            .layer_surfaces
+            .iter()
+            .find(|l| l.surface.wl_surface() == &root)
+        {
+            l.geo.loc
+        } else {
+            return;
+        };
+
+        let top = if self.workspace.show_bar { BAR_HEIGHT } else { 0 };
+        let mut target = Rectangle::new(
+            Point::from((0, top)),
+            Size::from((self.output_size.w, self.output_size.h - top)),
+        );
+        // The positioner works relative to the parent's window geometry.
+        target.loc -= get_popup_toplevel_coords(&kind);
+        target.loc -= root_loc;
+        popup.with_pending_state(|state| {
+            state.geometry = state.positioner.get_unconstrained_geometry(target);
+        });
+    }
+}
+
+/// Tell a surface the scale to render at: exact fractional scale for clients supporting
+/// `wp_fractional_scale_v1`, the next integer buffer scale for the rest (downsampled crisply).
+fn apply_preferred_scale(surface: &WlSurface, scale: f64) {
+    with_states(surface, |states| {
+        with_fractional_scale(states, |fractional_scale| {
+            fractional_scale.set_preferred_scale(scale);
+        });
+        send_surface_state(surface, states, scale.ceil() as i32, Transform::Normal);
+    });
+}
+
+/// Startup scale: `PURPWM_SCALE`, else the value saved by the scale keybindings, else the default.
+pub fn initial_scale() -> f64 {
+    std::env::var("PURPWM_SCALE")
+        .ok()
+        .or_else(|| std::fs::read_to_string(scale_file_path()?).ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite())
+        .unwrap_or(DEFAULT_SCALE)
+        .clamp(SCALE_MIN, SCALE_MAX)
+}
+
+fn scale_file_path() -> Option<PathBuf> {
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(config_dir.join("purpwm").join("scale"))
+}
+
+/// Built-in brightness fallback when `brightnessctl` is missing: ask logind (no root needed
+/// for the active session) to step the first backlight by `percent_delta`.
+fn adjust_backlight_via_logind(percent_delta: i32) {
+    std::thread::spawn(move || {
+        let Some(device) = std::fs::read_dir("/sys/class/backlight")
+            .ok()
+            .and_then(|mut entries| entries.next())
+            .and_then(|e| e.ok())
+        else {
+            tracing::warn!("No backlight device found in /sys/class/backlight");
+            return;
+        };
+        let read = |name: &str| -> Option<i64> {
+            std::fs::read_to_string(device.path().join(name))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        let (Some(cur), Some(max)) = (read("brightness"), read("max_brightness")) else {
+            return;
+        };
+        let step = (max * percent_delta.abs() as i64 / 100).max(1);
+        let next = (if percent_delta >= 0 { cur + step } else { cur - step }).clamp(max / 100, max);
+        let name = device.file_name().to_string_lossy().into_owned();
+        let _ = Command::new("busctl")
+            .args([
+                "call",
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1/session/auto",
+                "org.freedesktop.login1.Session",
+                "SetBrightness",
+                "ssu",
+                "backlight",
+                &name,
+                &next.to_string(),
+            ])
+            .status();
+    });
+}
+
+/// Local `YYYYmmdd-HHMMSS` timestamp for screenshot file names.
+fn screenshot_timestamp() -> String {
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut tm);
+        format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
     }
 }
 
@@ -985,6 +1349,16 @@ impl CompositorHandler for PurpState {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        // Tell new surfaces which scale to render at (no-op when already sent).
+        apply_preferred_scale(surface, self.scale);
+
+        // Popups get their initial configure in response to their first commit.
+        self.popup_manager.commit(surface);
+        if let Some(PopupKind::Xdg(ref popup)) = self.popup_manager.find_popup(surface) {
+            if !popup.is_initial_configure_sent() {
+                let _ = popup.send_configure();
+            }
+        }
 
         let needs_rule_check = self
             .windows
@@ -998,30 +1372,17 @@ impl CompositorHandler for PurpState {
         for layer in &mut self.layer_surfaces {
             if layer.surface.wl_surface() == surface {
                 is_layer = true;
-                let state = with_states(surface, |states| {
-                    *states.cached_state.get::<LayerSurfaceCachedState>().current()
-                });
-                let target_w = if state.size.w > 0 {
-                    state.size.w
-                } else {
-                    740
-                };
-                let target_h = if state.size.h > 0 {
-                    state.size.h
-                } else {
-                    620
-                };
+                layer.compute_geometry(self.output_size);
+                let size = layer.geo.size;
                 layer.surface.with_pending_state(|pending| {
-                    pending.size = Some(Size::from((target_w, target_h)));
+                    pending.size = Some(size);
                 });
                 let _ = layer.surface.send_pending_configure();
-                layer.compute_geometry(self.output_size);
             }
         }
         if is_layer {
             self.sync_keyboard_focus();
         }
-        self.bar.mark_dirty();
     }
 }
 
@@ -1053,7 +1414,23 @@ impl SeatHandler for PurpState {
 }
 
 impl SelectionHandler for PurpState {
-    type SelectionUserData = ();
+    /// PNG bytes of the last screenshot, offered by the compositor on the clipboard.
+    type SelectionUserData = Arc<Vec<u8>>;
+
+    fn send_selection(
+        &mut self,
+        _ty: SelectionTarget,
+        _mime_type: String,
+        fd: OwnedFd,
+        _seat: Seat<Self>,
+        user_data: &Self::SelectionUserData,
+    ) {
+        // Write on a thread: a slow reader must not stall the compositor.
+        let png_bytes = Arc::clone(user_data);
+        std::thread::spawn(move || {
+            let _ = std::fs::File::from(fd).write_all(&png_bytes);
+        });
+    }
 }
 
 impl DataDeviceHandler for PurpState {
@@ -1077,34 +1454,32 @@ impl OutputHandler for PurpState {}
 
 impl FractionalScaleHandler for PurpState {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
-        with_states(&surface, |states| {
-            with_fractional_scale(states, |fractional_scale| {
-                fractional_scale.set_preferred_scale(1.0);
-            });
-        });
+        apply_preferred_scale(&surface, self.scale);
     }
+}
+
+/// Always answer with server-side decorations. The configure is forced: the toplevel was
+/// usually configured (with `ServerSide` already pending) before the client created its
+/// decoration object, so a "pending changes only" configure would never tell the client,
+/// and it would fall back to drawing its own titlebar.
+fn force_server_side_decorations(toplevel: &ToplevelSurface) {
+    toplevel.with_pending_state(|state| {
+        state.decoration_mode = Some(DecorationMode::ServerSide);
+    });
+    toplevel.send_configure();
 }
 
 impl XdgDecorationHandler for PurpState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_pending_configure();
+        force_server_side_decorations(&toplevel);
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_pending_configure();
+        force_server_side_decorations(&toplevel);
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
-        toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(DecorationMode::ServerSide);
-        });
-        toplevel.send_pending_configure();
+        force_server_side_decorations(&toplevel);
     }
 }
 
@@ -1201,6 +1576,13 @@ impl XdgShellHandler for PurpState {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         self.windows.retain(|w| w.toplevel != surface);
+        if self
+            .hovered_surface
+            .as_ref()
+            .is_some_and(|s| s == surface.wl_surface())
+        {
+            self.hovered_surface = None;
+        }
         self.ensure_valid_focus();
         self.relayout();
         #[cfg(target_os = "linux")]
@@ -1209,25 +1591,63 @@ impl XdgShellHandler for PurpState {
         }
     }
 
-    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        let _ = surface.send_configure();
-        self.popups.push(surface);
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        // The initial configure is sent on the popup's first commit (see `commit`).
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+        });
+        self.unconstrain_popup(&surface);
+        if let Err(err) = self.popup_manager.track_popup(PopupKind::Xdg(surface)) {
+            tracing::warn!("Failed to track popup: {}", err);
+        }
     }
 
-    fn popup_destroyed(&mut self, surface: PopupSurface) {
-        self.popups.retain(|p| p != &surface);
-    }
+    /// Explicit popup grab (menus): keyboard goes to the menu and clicking outside dismisses it.
+    fn grab(&mut self, surface: PopupSurface, _seat: wl_seat::WlSeat, serial: Serial) {
+        let kind = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+        let seat = self.seat.clone();
+        let Ok(mut grab) = self.popup_manager.grab_popup(root, kind, &seat, serial) else {
+            return;
+        };
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+        let keyboard = self.keyboard.clone();
+        let pointer = self.pointer.clone();
+        if keyboard.is_grabbed()
+            && !(keyboard.has_grab(serial)
+                || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+        {
+            grab.ungrab(PopupUngrabStrategy::All);
+            return;
+        }
+        keyboard.set_focus(self, grab.current_grab(), serial);
+        keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+
+        if pointer.is_grabbed()
+            && !(pointer.has_grab(serial)
+                || pointer.has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+        {
+            grab.ungrab(PopupUngrabStrategy::All);
+            return;
+        }
+        pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+    }
 
     fn reposition_request(
         &mut self,
         surface: PopupSurface,
-        _positioner: PositionerState,
+        positioner: PositionerState,
         token: u32,
     ) {
-        let _ = surface.send_repositioned(token);
-        let _ = surface.send_configure();
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        self.unconstrain_popup(&surface);
+        // `send_repositioned` already includes the configure event.
+        surface.send_repositioned(token);
     }
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
