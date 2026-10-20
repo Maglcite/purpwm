@@ -203,8 +203,7 @@ impl PurpState {
 
                 // Pressing `Escape` while the keybinding cheat sheet is open dismisses it.
                 if app.help.visible && sym.raw() == keysyms::KEY_Escape && !is_mod_active(mods) {
-                    app.help.visible = false;
-                    return FilterResult::Intercept(None);
+                    return FilterResult::Intercept(Some(KeyAction::ToggleHelp));
                 }
 
                 // 2. Global hardware media / brightness / screenshot / lock keys (work without Mod)
@@ -432,7 +431,10 @@ impl PurpState {
 
     pub fn execute_key_action(&mut self, action: KeyAction) {
         match action {
-            KeyAction::ToggleHelp => self.help.toggle(),
+            KeyAction::ToggleHelp => {
+                self.help.toggle();
+                self.sync_pointer_focus(0);
+            }
             KeyAction::SpawnLauncher => self.spawn_launcher(),
             KeyAction::SpawnTerminal => self.spawn_terminal(),
             KeyAction::SpawnSystemMonitor => self.spawn_system_monitor(),
@@ -724,7 +726,12 @@ impl PurpState {
         }
         self.bar_scroll_accum = 0.0;
 
-        let mut frame = AxisFrame::new(Event::time_msec(&event)).source(event.source());
+        let time = Event::time_msec(&event);
+        if !self.pointer.is_grabbed() {
+            self.sync_pointer_focus(time);
+        }
+
+        let mut frame = AxisFrame::new(time).source(event.source());
         for axis in [Axis::Horizontal, Axis::Vertical] {
             let amount = continuous(axis);
             if amount != 0.0 {
@@ -756,6 +763,7 @@ impl PurpState {
         }
         if state == ButtonState::Pressed && self.help.visible {
             self.help.visible = false;
+            self.sync_pointer_focus(time);
             return;
         }
 
@@ -775,6 +783,7 @@ impl PurpState {
                 .notifications
                 .dismiss_at(pos, self.output_size.w, self.bar_visible())
         {
+            self.sync_pointer_focus(time);
             return;
         }
 
@@ -866,6 +875,12 @@ impl PurpState {
     }
 
     fn forward_pointer_button(&mut self, button: u32, state: ButtonState, time: u32) {
+        // Ensure `self.pointer` has up-to-date focus and surface-local coordinates before
+        // delivering a button press (e.g. if a window/popup appeared or moved under a
+        // stationary cursor, or if clicking an unfocused window just triggered `relayout()`).
+        if state == ButtonState::Pressed || !self.pointer.is_grabbed() {
+            self.sync_pointer_focus(time);
+        }
         let pointer = self.pointer.clone();
         pointer.button(
             self,
@@ -877,10 +892,13 @@ impl PurpState {
             },
         );
         pointer.frame(self);
-        // A click outside an open menu ends its grab; hand keyboard focus back to the
-        // window under the pointer instead of the menu's parent.
+        // A click outside an open menu ends its grab; hand keyboard and pointer focus
+        // back to the window now under the pointer.
         if state == ButtonState::Pressed {
             self.sync_keyboard_focus();
+        }
+        if !self.pointer.is_grabbed() {
+            self.sync_pointer_focus(time);
         }
     }
 
@@ -901,6 +919,7 @@ impl PurpState {
         }
         if self.help.visible {
             self.help.visible = false;
+            self.sync_pointer_focus(time);
             return;
         }
 
@@ -908,6 +927,7 @@ impl PurpState {
             .notifications
             .dismiss_at(pos, self.output_size.w, self.bar_visible())
         {
+            self.sync_pointer_focus(time);
             return;
         }
 

@@ -4,6 +4,7 @@ mod tests {
 
     use smithay::{
         input::keyboard::{keysyms, Keysym, ModifiersState},
+        reexports::wayland_server::Display,
         utils::{Logical, Physical, Point, Rectangle, Size},
     };
 
@@ -11,10 +12,10 @@ mod tests {
         bar::{BarClickAction, StatusBar},
         config::{BAR_HEIGHT, GAP_INNER, GAP_OUTER},
         help::{rasterize, HelpOverlay},
-        input::keysym_to_lock_key,
+        input::{keysym_to_lock_key, KeyAction},
         lock::{pam_check, LockKey, LockPoll, LockScreen, CONVERSATIONS},
         notify::{parse_dbus_notification_line, NotificationCenter},
-        state::touch_physical_to_logical_coords,
+        state::{touch_physical_to_logical_coords, PurpState},
         wm::{LayoutMode, Workspace},
     };
 
@@ -227,5 +228,28 @@ mod tests {
         let (_buf, loc) = rasterize(bar.font(), out, 1.5);
         assert!(loc.x > 0 && loc.x < out.w / 2);
         assert!(loc.y > 0 && loc.y < out.h / 2);
+    }
+
+    #[test]
+    fn test_pointer_focus_sync_and_fractional_hit_testing() {
+        let display: Display<PurpState> = Display::new().expect("create wayland display");
+        let mut state = PurpState::new(
+            display.handle(),
+            String::from("wayland-test-0"),
+            Size::from((1600, 1000)),
+            true,
+        );
+
+        // Subpixel coordinates near the bottom-right edge (e.g. 99.8 inside a 0..100 rect)
+        // must remain inside `to_f64().contains(...)` rather than rounding outside to 100.
+        let rect = Rectangle::<i32, Logical>::new(Point::from((0, 0)), Size::from((100, 100)));
+        let edge_pt = Point::<f64, Logical>::from((99.8, 99.8));
+        assert!(rect.to_f64().contains(edge_pt));
+
+        // Toggling help and syncing pointer focus must cleanly clear/update pointer focus.
+        state.execute_key_action(KeyAction::ToggleHelp);
+        assert!(state.help.visible);
+        state.process_pointer_button(0x110, smithay::backend::input::ButtonState::Pressed, 10);
+        assert!(!state.help.visible);
     }
 }

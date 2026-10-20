@@ -18,11 +18,10 @@ use smithay::{
         input::{Keycode, TouchSlot},
         renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
-    delegate_compositor, delegate_cursor_shape, delegate_data_control, delegate_data_device, delegate_fractional_scale,
-    delegate_idle_inhibit, delegate_layer_shell, delegate_output, delegate_primary_selection,
-    delegate_seat, delegate_shm, delegate_single_pixel_buffer, delegate_viewporter,
-    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
-    output::Output,
+    delegate_compositor, delegate_cursor_shape, delegate_data_control, delegate_data_device,
+    delegate_fractional_scale, delegate_idle_inhibit, delegate_layer_shell, delegate_output,
+    delegate_primary_selection, delegate_seat, delegate_shm, delegate_single_pixel_buffer,
+    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         find_popup_root_surface, get_popup_toplevel_coords, utils::under_from_surface_tree,
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy,
@@ -34,6 +33,7 @@ use smithay::{
         touch::TouchHandle,
         Seat, SeatHandler, SeatState,
     },
+    output::Output,
     reexports::{
         wayland_protocols::xdg::{
             decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
@@ -53,13 +53,12 @@ use smithay::{
     },
     utils::{IsAlive, Logical, Point, Rectangle, Serial, Size, Transform, SERIAL_COUNTER},
     wayland::{
-        cursor_shape::CursorShapeManagerState,
-        tablet_manager::TabletSeatHandler,
         buffer::BufferHandler,
         compositor::{
             send_surface_state, with_states, with_surface_tree_downward, CompositorClientState,
             CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
         },
+        cursor_shape::CursorShapeManagerState,
         fractional_scale::{
             with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState,
         },
@@ -88,6 +87,7 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState},
         single_pixel_buffer::SinglePixelBufferState,
+        tablet_manager::TabletSeatHandler,
         viewporter::ViewporterState,
         xdg_activation::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
@@ -482,6 +482,7 @@ impl PurpState {
             LockPoll::Unlocked => {
                 self.lock_screen = None;
                 self.sync_keyboard_focus();
+                self.sync_pointer_focus(0);
                 true
             }
             LockPoll::Failed => true,
@@ -502,7 +503,7 @@ impl PurpState {
     }
 
     /// Re-run the `dwm` tiling engine, apply `WINDOW_RULES`, update layer surface geometries,
-    /// synchronize keyboard + clipboard focus, and mark the status bar dirty.
+    /// synchronize keyboard + pointer + clipboard focus, and mark the status bar dirty.
     pub fn relayout(&mut self) {
         let prev_len = self.windows.len();
         self.windows.retain(|w| w.toplevel.alive());
@@ -591,6 +592,7 @@ impl PurpState {
         self.workspace
             .arrange(&mut self.windows, self.focused_idx, self.output_size);
         self.sync_keyboard_focus();
+        self.sync_pointer_focus(0);
     }
 
     fn ensure_valid_focus(&mut self) {
@@ -626,6 +628,28 @@ impl PurpState {
 
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, target_surface, SERIAL_COUNTER.next_serial());
+    }
+
+    /// Synchronize `wl_pointer` focus (`wl_pointer.enter` / `leave` / `motion`) with the
+    /// surface currently under `self.pointer_location`, even when the mouse is stationary.
+    /// Needed whenever windows, popups, subsurfaces, or overlays map, unmap, or move under the cursor.
+    pub fn sync_pointer_focus(&mut self, time: u32) {
+        let under = if self.is_locked() || self.help.visible {
+            None
+        } else {
+            self.surface_under(self.pointer_location)
+        };
+        let pointer = self.pointer.clone();
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location: self.pointer_location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(self);
     }
 
     /// Change the output scale by `delta` (`Mod + Ctrl + =` / `Mod + Ctrl + -`) and remember it.
@@ -1390,17 +1414,25 @@ impl PurpState {
         }
     }
 
-    /// Check if `point` hits a mapped `Top`/`Overlay` layer-shell surface (such as `Spotlight`).
+    /// Check if `point` hits a mapped `Top`/`Overlay` layer-shell surface (such as `Spotlight`),
+    /// respecting its surface tree and input region.
     pub fn layer_surface_at(
         &self,
         point: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<i32, Logical>)> {
-        let p = point.to_i32_round();
         for layer in self.layer_surfaces.iter().rev() {
             if layer.surface.alive()
+                && layer.namespace != "Spotlight-keepalive"
                 && layer.is_above_windows()
                 && layer.is_mapped()
-                && layer.geo.contains(p)
+                && layer.geo.to_f64().contains(point)
+                && under_from_surface_tree(
+                    layer.surface.wl_surface(),
+                    point,
+                    layer.geo.loc,
+                    WindowSurfaceType::ALL,
+                )
+                .is_some()
             {
                 return Some((layer.surface.wl_surface().clone(), layer.geo.loc));
             }
@@ -1410,16 +1442,27 @@ impl PurpState {
 
     /// Find the topmost visible window at `point` (in logical coordinates).
     pub fn window_at(&self, point: Point<f64, Logical>) -> Option<(usize, Point<i32, Logical>)> {
-        let p = point.to_i32_round();
         self.stacking_order()
             .into_iter()
-            .find(|&idx| self.windows[idx].geo.contains(p))
+            .find(|&idx| self.windows[idx].geo.to_f64().contains(point))
             .map(|idx| (idx, self.windows[idx].surface_loc()))
     }
 
-    /// Popups of every visible window (topmost first) with their buffer origin in global coordinates.
+    /// Popups of every visible overlay and window (topmost first) with their buffer origin in global coordinates.
     pub fn visible_popups(&self) -> Vec<(PopupKind, Point<i32, Logical>)> {
         let mut out = Vec::new();
+        for layer in self.layer_surfaces.iter().rev() {
+            if layer.surface.alive()
+                && layer.namespace != "Spotlight-keepalive"
+                && layer.is_mapped()
+            {
+                for (popup, offset) in PopupManager::popups_for_surface(layer.surface.wl_surface())
+                {
+                    let loc = layer.geo.loc + offset - popup.geometry().loc;
+                    out.push((popup, loc));
+                }
+            }
+        }
         for idx in self.stacking_order() {
             let w = &self.windows[idx];
             let content_loc = w.content_loc();
@@ -1447,7 +1490,11 @@ impl PurpState {
         point: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
         if let Some((surf, loc)) = self.layer_surface_at(point) {
-            return Some((surf, loc.to_f64()));
+            return Some(
+                under_from_surface_tree(&surf, point, loc, WindowSurfaceType::ALL)
+                    .map(|(s, l)| (s, l.to_f64()))
+                    .unwrap_or_else(|| (surf, loc.to_f64())),
+            );
         }
         for (popup, loc) in self.visible_popups() {
             if let Some((surf, surf_loc)) =
@@ -1735,6 +1782,9 @@ impl CompositorHandler for PurpState {
         if is_layer {
             self.sync_keyboard_focus();
         }
+        // A newly mapped or unmapped popup, subsurface, or updated input_region under the
+        // stationary pointer must immediately update `wl_pointer` focus.
+        self.sync_pointer_focus(0);
     }
 }
 
@@ -1936,6 +1986,13 @@ impl WlrLayerShellHandler for PurpState {
         self.layer_surfaces.retain(|l| l.surface != surface);
         self.relayout();
     }
+
+    fn new_popup(&mut self, _parent: LayerSurface, popup: PopupSurface) {
+        self.unconstrain_popup(&popup);
+        if let Err(err) = self.popup_manager.track_popup(PopupKind::Xdg(popup)) {
+            tracing::warn!("Failed to track layer-shell popup: {}", err);
+        }
+    }
 }
 
 impl XdgShellHandler for PurpState {
@@ -1994,6 +2051,12 @@ impl XdgShellHandler for PurpState {
         }
     }
 
+    fn popup_destroyed(&mut self, _surface: PopupSurface) {
+        self.popup_manager.cleanup();
+        self.sync_keyboard_focus();
+        self.sync_pointer_focus(0);
+    }
+
     /// Explicit popup grab (menus): keyboard goes to the menu and clicking outside dismisses it.
     fn grab(&mut self, surface: PopupSurface, _seat: wl_seat::WlSeat, serial: Serial) {
         let kind = PopupKind::Xdg(surface);
@@ -2040,6 +2103,7 @@ impl XdgShellHandler for PurpState {
         self.unconstrain_popup(&surface);
         // `send_repositioned` already includes the configure event.
         surface.send_repositioned(token);
+        self.sync_pointer_focus(0);
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
