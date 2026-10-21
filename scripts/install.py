@@ -28,13 +28,15 @@ BUILD_PACKAGES = {
 DESKTOP_PACKAGES = {
     "pacman": "gamescope alacritty networkmanager bluez-utils wireplumber pavucontrol "
               "playerctl brightnessctl btop python-gobject gtk4 polkit gnome-keyring "
-              "libsecret fontconfig ttf-dejavu",
+              "libsecret fontconfig ttf-dejavu flameshot xdg-desktop-portal xdg-desktop-portal-gtk",
     "apt-get": "alacritty network-manager bluez wireplumber pavucontrol playerctl "
                "brightnessctl btop python3-gi gir1.2-gtk-4.0 gir1.2-polkit-1.0 "
-               "gnome-keyring libsecret-1-0 fontconfig fonts-dejavu-core",
+               "gnome-keyring libsecret-1-0 fontconfig fonts-dejavu-core flameshot "
+               "xdg-desktop-portal xdg-desktop-portal-gtk",
     "dnf": "gamescope alacritty NetworkManager bluez wireplumber pavucontrol playerctl "
            "brightnessctl btop python3-gobject gtk4 polkit gnome-keyring libsecret "
-           "fontconfig dejavu-sans-mono-fonts",
+           "fontconfig dejavu-sans-mono-fonts flameshot xdg-desktop-portal "
+           "xdg-desktop-portal-gtk",
 }
 
 
@@ -96,6 +98,9 @@ def parser():
     p.add_argument("--session", choices=("yes", "no"), help="Register a login session (default: system only)")
     p.add_argument("--pam", choices=("yes", "no"), help="Create lock PAM service (default: system only)")
     p.add_argument("--pam-dir", default="/etc/pam.d", help="PAM service directory")
+    p.add_argument("--keyring-pam", choices=("yes", "no"),
+                   help="Unlock GNOME Keyring at login by adding hooks to the greetd/login/passwd "
+                        "PAM services (default: no)")
     p.add_argument("--dependencies", choices=("none", "build", "desktop"), help="Distro packages; desktop includes build dependencies")
     p.add_argument("--terminal", help="Terminal executable name/path, or auto")
     p.add_argument("--spotlight", help="Spotlight executable name/path, auto, or none")
@@ -125,19 +130,21 @@ def configure(args):
     defaults = {
         "prefix": "/usr/local" if system else str(home / ".local"),
         "session": "yes" if system else "no", "pam": "yes" if system else "no",
+        "keyring_pam": "no",
         "dependencies": ("desktop" if system else "build") if interactive and package_manager() else "none",
         "terminal": "auto", "spotlight": "auto", "font": "auto", "scale": 1.5,
         "refresh_rate": 120, "resolution": "auto", "autostart": "yes",
     }
     labels = {"prefix": "Install prefix", "session": "Add a login-screen session",
               "pam": "Create screen-lock PAM service (preserve existing)",
+              "keyring_pam": "Unlock the keyring at login (edits login PAM, keeps a backup)",
               "dependencies": "Install dependencies", "terminal": "Terminal executable",
               "spotlight": "Spotlight executable (auto/path/none)", "font": "Font file (auto/path)",
               "scale": "Default UI scale (1.0–3.0)", "refresh_rate": "Refresh rate (Hz)",
               "resolution": "Resolution (auto or WIDTHxHEIGHT)", "autostart": "Start session helpers"}
     for key, default in defaults.items():
         if getattr(args, key) is None:
-            choices = ("yes", "no") if key in ("session", "pam", "autostart") else None
+            choices = ("yes", "no") if key in ("session", "pam", "keyring_pam", "autostart") else None
             if key == "dependencies":
                 choices = ("none", "build", "desktop")
             setattr(args, key, ask(labels[key], default, choices) if interactive else default)
@@ -170,6 +177,8 @@ def configure(args):
         raise ValueError("Refresh rate must be between 1 and 1000 Hz.")
     if args.resolution != "auto" and not re.fullmatch(r"[1-9][0-9]{2,4}x[1-9][0-9]{2,4}", args.resolution):
         raise ValueError("Resolution must be auto or WIDTHxHEIGHT, for example 2560x1600.")
+    if args.keyring_pam == "yes" and args.destdir:
+        raise ValueError("--keyring-pam edits the live /etc/pam.d and cannot be staged; use --keyring-pam no.")
     if args.pam == "yes" and not system and not args.destdir:
         raise ValueError("Use --system for a PAM service, or --pam no for a user installation.")
     if args.binary and not args.no_build:
@@ -330,6 +339,7 @@ def main(argv=None):
           f"Session defaults: {args.config_dir / 'session.conf'}\n"
           f"Login session: {args.session_dir / 'purpwm.desktop' if args.session == 'yes' else 'disabled'}\n"
           f"Lock PAM: {args.pam_dir / 'purpwm' if args.pam == 'yes' else 'unchanged'}\n"
+          f"Keyring login unlock: {args.keyring_pam}\n"
           f"Scale: {args.scale}; refresh: {args.refresh_rate} Hz; resolution: {args.resolution}\n"
           f"Terminal: {args.terminal}; Spotlight: {args.spotlight}; font: {args.font}\n"
           f"Autostart: {args.autostart}; build: {'reuse binary' if args.no_build else 'release (Cargo.lock)'}")
@@ -367,7 +377,7 @@ def main(argv=None):
         (stage / "session.conf").write_text(session_config(args, terminal, spotlight, font))
         install_file(binary, args.bin_dir / "purpwm", "755", args)
         install_file(stage / "start-purpwm", args.bin_dir / "start-purpwm", "755", args)
-        for helper in ("purpwm-wifi", "purpwm-bt", "purpwm-polkit-agent"):
+        for helper in ("purpwm-wifi", "purpwm-bt", "purpwm-polkit-agent", "purpwm-keyring", "purpwm-portal"):
             install_file(REPO / helper, args.bin_dir / helper, "755", args)
         install_file(stage / "session.conf", args.config_dir / "session.conf", "644", args, backup=True)
         if pam is not None:
@@ -376,6 +386,9 @@ def main(argv=None):
         if args.session == "yes":
             (stage / "purpwm.desktop").write_text(desktop_entry(args.bin_dir / "start-purpwm"))
             install_file(stage / "purpwm.desktop", args.session_dir / "purpwm.desktop", "644", args)
+    if args.keyring_pam == "yes":
+        # The login (greeter) PAM stack, separate from the screen-lock service above.
+        run([sys.executable, REPO / "scripts/configure-keyring-pam.py"], privileged=True)
     print(f"\npurpwm installed. Session settings: {args.config_dir / 'session.conf'}")
     if args.destdir:
         print("Files were staged only; the live system was not installed.")

@@ -48,6 +48,8 @@ pub enum BarClickAction {
     Bluetooth,
     /// Clicked on the volume pill (`[ VOL 45% ]`).
     Volume,
+    /// Clicked on the Flameshot screenshot button.
+    Flameshot,
     /// Clicked on the right-aligned System Metrics area (CPU / MEM / BAT / Clock).
     SystemMonitor,
     /// Clicked on the window title area.
@@ -106,6 +108,7 @@ pub struct StatusBar {
     wifi_pill_range: (i32, i32),
     bt_pill_range: (i32, i32),
     vol_pill_range: (i32, i32),
+    flameshot_pill_range: (i32, i32),
     metrics_range: (i32, i32),
 }
 
@@ -175,6 +178,7 @@ impl StatusBar {
             wifi_pill_range: (0, 0),
             bt_pill_range: (0, 0),
             vol_pill_range: (0, 0),
+            flameshot_pill_range: (0, 0),
             metrics_range: (0, 0),
         };
         bar.cache_ascii_glyphs();
@@ -533,6 +537,9 @@ impl StatusBar {
         {
             return BarClickAction::SystemMonitor;
         }
+        if x >= self.flameshot_pill_range.0 && x < self.flameshot_pill_range.1 {
+            return BarClickAction::Flameshot;
+        }
         BarClickAction::FocusNext
     }
 
@@ -633,6 +640,7 @@ impl StatusBar {
         let mut wifi_range_out = (0, 0);
         let mut bt_range_out = (0, 0);
         let mut vol_range_out = (0, 0);
+        let mut flameshot_range_out = (0, 0);
         let mut metrics_range_out = (0, 0);
 
         let mut ctx = self.buffer.render();
@@ -844,6 +852,36 @@ impl StatusBar {
                 wifi_range_out = (right_cursor, right_cursor + wifi_pill_w);
             }
 
+            // Flameshot screenshot button, beside the Wi-Fi pill.
+            let flameshot_w = measure_text(font_ref, glyph_cache, "Flameshot", font_px) + px(20);
+            let flameshot_x = right_cursor - flameshot_w - px(8);
+            if flameshot_x > cur_x + px(40) {
+                right_cursor = flameshot_x;
+                fill_rect(
+                    buf,
+                    w,
+                    h,
+                    right_cursor,
+                    px(3),
+                    flameshot_w,
+                    h - px(7),
+                    BAR_LAYOUT_BG_RGBA,
+                );
+                draw_text(
+                    buf,
+                    w,
+                    h,
+                    font_ref,
+                    glyph_cache,
+                    "Flameshot",
+                    right_cursor + px(10),
+                    text_y,
+                    font_px,
+                    BAR_ACCENT_RGBA,
+                );
+                flameshot_range_out = (right_cursor, right_cursor + flameshot_w);
+            }
+
             // 6. Draw active window title in the middle section
             let title_avail_w = (right_cursor - cur_x - px(24)).max(0);
             if title_avail_w > px(32) && !focused_title.is_empty() {
@@ -875,6 +913,7 @@ impl StatusBar {
         self.wifi_pill_range = wifi_range_out;
         self.bt_pill_range = bt_range_out;
         self.vol_pill_range = vol_range_out;
+        self.flameshot_pill_range = flameshot_range_out;
         self.metrics_range = metrics_range_out;
     }
 

@@ -99,10 +99,12 @@ use crate::{
     bar::StatusBar,
     config::{
         AUTOSTART_COMMANDS, BAR_HEIGHT, BLUETOOTH_COMMANDS, BORDER_WIDTH, BRIGHTNESS_DOWN_COMMANDS,
-        BRIGHTNESS_UP_COMMANDS, DEFAULT_SCALE, LAUNCHER_COMMANDS, MEDIA_NEXT_COMMANDS,
-        MEDIA_PLAY_COMMANDS, MEDIA_PREV_COMMANDS, MIC_MUTE_COMMANDS, MIXER_COMMANDS, MOVE_STEP,
+        BRIGHTNESS_UP_COMMANDS, DEFAULT_SCALE, FLAMESHOT_COMMANDS, KEYRING_COMMANDS,
+        LAUNCHER_COMMANDS, MEDIA_NEXT_COMMANDS, MEDIA_PLAY_COMMANDS, MEDIA_PREV_COMMANDS,
+        MIC_MUTE_COMMANDS, MIXER_COMMANDS, MOVE_STEP,
         POLKIT_COMMANDS, RESIZE_STEP, SCALE_MAX, SCALE_MIN, SCALE_STEP, SCREENSHOT_DIR,
-        SYSTEM_MONITOR_COMMANDS, TAGMASK, TERMINAL_COMMANDS, VOL_DOWN_COMMANDS, VOL_MUTE_COMMANDS,
+        SCREENSHOT_PORTAL_COMMANDS, SYSTEM_MONITOR_COMMANDS, TAGMASK, TERMINAL_COMMANDS,
+        VOL_DOWN_COMMANDS, VOL_MUTE_COMMANDS,
         VOL_UP_COMMANDS, WIFI_COMMANDS, WINDOW_RULES, window_rules_settled,
     },
     cursor::CursorTheme,
@@ -1369,6 +1371,11 @@ impl PurpState {
         self.bar.request_immediate_status_refresh();
     }
 
+    /// Open Flameshot's capture UI from its status bar button.
+    pub fn spawn_flameshot(&self) {
+        self.spawn_first_available(FLAMESHOT_COMMANDS, "Flameshot screenshot UI");
+    }
+
     /// Open the floating Wi-Fi Manager (`Mod + w` or Left-Click on `WIFI:` status bar pill).
     pub fn spawn_wifi_manager(&self) {
         self.spawn_first_available(WIFI_COMMANDS, "Wi-Fi manager");
@@ -1419,6 +1426,15 @@ impl PurpState {
             }
         });
         self.bar.request_immediate_status_refresh();
+    }
+
+    /// Initialize the OS keyring on this compositor's display, including direct launches.
+    pub fn spawn_keyring(&self) {
+        self.spawn_first_available(KEYRING_COMMANDS, "OS keyring");
+    }
+
+    pub fn spawn_screenshot_portal(&self) {
+        self.spawn_first_available(SCREENSHOT_PORTAL_COMMANDS, "screenshot portal");
     }
 
     /// Spawn the polkit authentication agent (`purpwm-polkit-agent`).
@@ -1600,6 +1616,11 @@ impl PurpState {
             .args(&cmd[1..])
             .stdin(Stdio::null())
             .env("WAYLAND_DISPLAY", &self.socket_name)
+            .env(
+                "PURPWM_CAPTURE_SOCKET",
+                self.runtime_dir
+                    .join(format!("purpwm-capture-{}.sock", self.socket_name)),
+            )
             .env("XDG_RUNTIME_DIR", &self.runtime_dir)
             .env("XDG_SESSION_TYPE", "wayland")
             .env("XDG_CURRENT_DESKTOP", "purpwm")

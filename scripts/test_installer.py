@@ -64,7 +64,8 @@ class InstallerTests(unittest.TestCase):
 
     def test_user_install_and_launch_with_special_paths(self):
         self.install("--scale", "1.75", "--refresh-rate", "144")
-        for name in ("purpwm", "start-purpwm", "purpwm-wifi", "purpwm-bt", "purpwm-polkit-agent"):
+        for name in ("purpwm", "start-purpwm", "purpwm-wifi", "purpwm-bt", "purpwm-polkit-agent",
+                     "purpwm-keyring", "purpwm-portal"):
             self.assertTrue(os.access(self.prefix / "bin" / name, os.X_OK))
         self.assertFalse((self.root / "xdg-data/wayland-sessions").exists())
         report = self.launch("--spawn-terminal")
@@ -161,6 +162,15 @@ class InstallerTests(unittest.TestCase):
             self.assertNotIn(str(stage), launcher)
             self.assertIn("/opt/purpwm/share/purpwm/session.conf", launcher)
 
+    def test_keyring_pam_cannot_be_staged(self):
+        result = subprocess.run([str(setup.REPO / "install.sh"), "--system", "--non-interactive",
+                                 "--no-build", "--binary", str(self.stub), "--dependencies", "none",
+                                 "--destdir", str(self.root / "stage"), "--keyring-pam", "yes"],
+                                env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--keyring-pam", result.stderr)
+        self.assertFalse((self.root / "stage").exists())
+
     def test_pam_distro_selection_and_unknown_stack(self):
         directory = self.root / "pam"
         directory.mkdir()
@@ -190,7 +200,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_wizard_collects_options_without_writes(self):
         args = setup.parser().parse_args(["--dry-run"])
-        answers = iter(["user", str(self.prefix), "no", "no", "none", str(self.stub), "none", "auto",
+        answers = iter(["user", str(self.prefix), "no", "no", "no", "none", str(self.stub), "none", "auto",
                         "1.25", "144", "auto", "no", str(self.prefix / "bin"), str(self.config),
                         str(self.root / "sessions")])
         with patch.object(sys.stdin, "isatty", return_value=True), patch("builtins.input", side_effect=lambda _: next(answers)):
@@ -200,6 +210,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(options.scope, "user")
         self.assertEqual(options.scale, 1.25)
         self.assertEqual(options.refresh_rate, 144)
+        self.assertEqual(options.keyring_pam, "no")
         self.assertFalse(self.prefix.exists())
 
 

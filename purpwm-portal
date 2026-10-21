@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Native Screenshot portal backend for purpwm's framebuffer capture transport."""
+
+import argparse
+import configparser
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+# purpwm does not expose linux-dmabuf; avoid GTK's Vulkan WSI retry path.
+os.environ.setdefault("GSK_RENDERER", "gl")
+
+import gi
+gi.require_version("Gio", "2.0")
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gio, GLib, Gtk
+
+BUS_NAME = "org.freedesktop.impl.portal.desktop.purpwm"
+FRONTEND = "org.freedesktop.portal.Desktop"
+INTERFACE = "org.freedesktop.impl.portal.Screenshot"
+OBJECT = "/org/freedesktop/portal/desktop"
+XML = """<node><interface name="org.freedesktop.impl.portal.Screenshot">
+<method name="Screenshot"><arg type="o" direction="in"/><arg type="s" direction="in"/>
+<arg type="s" direction="in"/><arg type="a{sv}" direction="in"/>
+<arg type="u" direction="out"/><arg type="a{sv}" direction="out"/></method>
+<method name="PickColor"><arg type="o" direction="in"/><arg type="s" direction="in"/>
+<arg type="s" direction="in"/><arg type="a{sv}" direction="in"/>
+<arg type="u" direction="out"/><arg type="a{sv}" direction="out"/></method>
+<property name="version" type="u" access="read"/>
+</interface></node>"""
+REQUEST_XML = """<node><interface name="org.freedesktop.impl.portal.Request">
+<method name="Close"/></interface></node>"""
+DESCRIPTOR = f"""[portal]
+DBusName={BUS_NAME}
+Interfaces={INTERFACE};
+UseIn=purpwm
+"""
+
+
+def capture_png(endpoint):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(10)
+        stream.connect(str(endpoint))
+        stream.sendall(b"capture\n")
+        with stream.makefile("rb") as incoming:
+            header = incoming.readline(64)
+            if not header.startswith(b"OK ") or not header.endswith(b"\n"):
+                raise RuntimeError("Capture denied or compositor unavailable")
+            size = int(header[3:])
+            if not 8 <= size <= 256 * 1024 * 1024:
+                raise RuntimeError("Invalid screenshot size")
+            data = incoming.read(size)
+            if len(data) != size or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise RuntimeError("Incomplete screenshot")
+            return data
+
+
+def setup():
+    """Keep portal selection specific to purpwm; retain installed file chooser backends."""
+    data_home = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
+    directory = data_home / "purpwm/portals"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The frontend's backend discovery directory is compiled in. A merged directory
+    # lets an unprivileged session add its backend without losing distro backends.
+    descriptor_names = {"purpwm.portal"}
+    data_roots = [data_home]
+    data_roots.extend(Path(path) for path in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"))
+    for base in data_roots:
+        for descriptor in (base / "xdg-desktop-portal/portals").glob("*.portal"):
+            if descriptor.name in descriptor_names:
+                continue
+            descriptor_names.add(descriptor.name)
+            target = directory / descriptor.name
+            if target.is_symlink():
+                target.unlink()
+            if not target.exists():
+                target.symlink_to(descriptor)
+    (directory / "purpwm.portal").write_text(DESCRIPTOR)
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    # Preserve the config lookup for other desktops if the user service survives
+    # logout. User configuration takes precedence over distro defaults.
+    configuration_roots = [config_home]
+    configuration_roots.extend(Path(path) for path in os.environ.get("XDG_CONFIG_DIRS", "/etc/xdg").split(":"))
+    configuration_roots.extend([Path("/usr/local/share"), Path("/usr/share")])
+    configuration_names = {"purpwm-portals.conf"}
+    for base in configuration_roots:
+        for source in (base / "xdg-desktop-portal").glob("*portals.conf"):
+            if source.name in configuration_names:
+                continue
+            configuration_names.add(source.name)
+            target = directory / source.name
+            if target.is_symlink():
+                target.unlink()
+            if not target.exists():
+                target.symlink_to(source)
+    config = config_home / "xdg-desktop-portal/purpwm-portals.conf"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    if config.exists():
+        parser.read(config)
+    if not parser.has_section("preferred"):
+        parser.add_section("preferred")
+    changed = parser.get("preferred", INTERFACE, fallback="") != "purpwm"
+    if changed:
+        if config.exists() and not config.with_suffix(".conf.bak").exists():
+            shutil.copy2(config, config.with_suffix(".conf.bak"))
+        if not parser.has_option("preferred", "default"):
+            parser.set("preferred", "default", "gtk;*")
+        parser.set("preferred", INTERFACE, "purpwm")
+        with config.open("w") as output:
+            parser.write(output, space_around_delimiters=False)
+    # XDG_DESKTOP_PORTAL_DIR also overrides the frontend's config search path.
+    with (directory / "purpwm-portals.conf").open("w") as output:
+        parser.write(output, space_around_delimiters=False)
+    services = data_home / "dbus-1/services"
+    services.mkdir(parents=True, exist_ok=True)
+    executable = str(Path(__file__).resolve()).replace("\\", "\\\\").replace('"', '\\"')
+    (services / f"{BUS_NAME}.service").write_text(
+        f'[D-BUS Service]\nName={BUS_NAME}\nExec="{executable}"\n'
+    )
+    os.environ["XDG_DESKTOP_PORTAL_DIR"] = str(directory)
+    names = [name for name in (
+        "XDG_DESKTOP_PORTAL_DIR", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE",
+        "WAYLAND_DISPLAY", "DISPLAY", "GDK_BACKEND", "PURPWM_CAPTURE_SOCKET",
+    ) if name in os.environ]
+    subprocess.run(["dbus-update-activation-environment", "--systemd", *names], check=False)
+
+
+def cleanup_screenshots():
+    directory = Path(os.environ["XDG_RUNTIME_DIR"]) / "purpwm-screenshots"
+    for path in directory.glob("portal-*.png"):
+        try:
+            if time.time() - path.stat().st_mtime > 3600:
+                path.unlink()
+        except OSError:
+            pass
+    return True
+
+
+class Backend:
+    def __init__(self, connection, endpoint, ask=None):
+        self.connection = connection
+        self.endpoint = endpoint
+        self.pending = {}
+        self.ask = ask or self.ask_permission
+        self.info = Gio.DBusNodeInfo.new_for_xml(XML)
+        self.request_info = Gio.DBusNodeInfo.new_for_xml(REQUEST_XML)
+        self.registration = connection.register_object(
+            OBJECT, self.info.interfaces[0], self.on_call,
+            lambda *_: GLib.Variant("u", 2), None,
+        )
+
+    def trusted(self, sender):
+        try:
+            owner = self.connection.call_sync(
+                "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                "GetNameOwner", GLib.Variant("(s)", (FRONTEND,)),
+                GLib.VariantType.new("(s)"), Gio.DBusCallFlags.NONE, 1000, None,
+            ).unpack()[0]
+            return sender == owner
+        except GLib.Error:
+            return False
+
+    def on_call(self, connection, sender, path, interface, method, parameters, invocation):
+        if not self.trusted(sender):
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.AccessDenied",
+                                         "Only the desktop portal may call this backend")
+            return
+        handle, app_id, parent, options = parameters.unpack()
+        if method != "Screenshot" or len(self.pending) >= 8 or handle in self.pending:
+            invocation.return_value(GLib.Variant("(ua{sv})", (2, {})))
+            return
+        registration = connection.register_object(
+            handle, self.request_info.interfaces[0], self.on_close, None, None,
+        )
+        self.pending[handle] = {"invocation": invocation, "registration": registration,
+                                "dialog": None, "sender": sender}
+        self.ask(handle, app_id)
+
+    def on_close(self, connection, sender, path, interface, method, parameters, invocation):
+        pending = self.pending.get(path)
+        if pending and sender == pending["sender"]:
+            self.finish(path, 1)
+            invocation.return_value(None)
+        else:
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.AccessDenied", "Not your request")
+
+    def finish(self, handle, response, uri=None):
+        pending = self.pending.pop(handle, None)
+        if pending is None:
+            if uri:
+                Path(GLib.filename_from_uri(uri)[0]).unlink(missing_ok=True)
+            return False
+        if pending["dialog"]:
+            pending["dialog"].destroy()
+        self.connection.unregister_object(pending["registration"])
+        results = {"uri": GLib.Variant("s", uri)} if uri else {}
+        pending["invocation"].return_value(GLib.Variant("(ua{sv})", (response, results)))
+        return False
+
+    def ask_permission(self, handle, app_id):
+        Gtk.init()
+        window = Gtk.Window(title="Screenshot — purpwm")
+        window.set_default_size(440, 180)
+        window.set_modal(True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{side}")(24)
+        label = Gtk.Label(label=f"Allow {app_id or 'this application'} to capture your screen?")
+        label.set_wrap(True)
+        box.append(label)
+        buttons = Gtk.Box(spacing=12)
+        cancel = Gtk.Button(label="Cancel")
+        capture = Gtk.Button(label="Share screen")
+        capture.add_css_class("suggested-action")
+        cancel.connect("clicked", lambda *_: self.finish(handle, 1))
+        capture.connect("clicked", lambda *_: self.approve(handle))
+        window.connect("close-request", lambda *_: self.finish(handle, 1) or True)
+        buttons.append(cancel)
+        buttons.append(capture)
+        box.append(buttons)
+        window.set_child(box)
+        self.pending[handle]["dialog"] = window
+        window.present()
+
+    def approve(self, handle):
+        pending = self.pending.get(handle)
+        if pending is None:
+            return
+        if pending["dialog"]:
+            pending["dialog"].destroy()
+            pending["dialog"] = None
+        # Let the compositor remove the consent window before capturing the frame.
+        GLib.timeout_add(150, self.begin_capture, handle)
+
+    def begin_capture(self, handle):
+        if handle not in self.pending:
+            return False
+        def worker():
+            try:
+                data = capture_png(self.endpoint)
+                directory = Path(os.environ["XDG_RUNTIME_DIR"]) / "purpwm-screenshots"
+                directory.mkdir(mode=0o700, exist_ok=True)
+                with tempfile.NamedTemporaryFile(dir=directory, prefix="portal-", suffix=".png", delete=False) as output:
+                    output.write(data)
+                    uri = Path(output.name).as_uri()
+                GLib.idle_add(self.finish, handle, 0, uri)
+            except Exception as error:
+                print(f"purpwm-portal: {error}", file=sys.stderr)
+                GLib.idle_add(self.finish, handle, 2)
+        threading.Thread(target=worker, daemon=True).start()
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--install", action="store_true", help="Install per-user portal selection")
+    parser.add_argument("--session", action="store_true", help="Refresh the portal frontend for this desktop session")
+    args = parser.parse_args()
+    if not os.environ.get("XDG_RUNTIME_DIR"):
+        parser.error("XDG_RUNTIME_DIR is required")
+    setup()
+    if args.install:
+        print("Installed purpwm's Screenshot portal configuration.")
+        return
+    endpoint = os.environ.get("PURPWM_CAPTURE_SOCKET") or str(
+        Path(os.environ["XDG_RUNTIME_DIR"]) / f"purpwm-capture-{os.environ.get('WAYLAND_DISPLAY', 'wayland-1')}.sock"
+    )
+    connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    cleanup_screenshots()
+    GLib.timeout_add_seconds(900, cleanup_screenshots)
+    backend = Backend(connection, endpoint)
+    loop = GLib.MainLoop()
+    if args.session:
+        parent = os.getppid()
+        def parent_alive():
+            if os.getppid() != parent:
+                loop.quit()
+                return False
+            return True
+        GLib.timeout_add_seconds(2, parent_alive)
+    def acquired(*_):
+        print("purpwm Screenshot portal ready", flush=True)
+        # The frontend caches its backend choice, so refresh it after registering.
+        if args.session:
+            subprocess.Popen(["systemctl", "--user", "try-restart", "xdg-desktop-portal.service"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    owner = Gio.bus_own_name_on_connection(
+        connection, BUS_NAME,
+        Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT | Gio.BusNameOwnerFlags.REPLACE,
+        acquired, lambda *_: loop.quit(),
+    )
+    try:
+        loop.run()
+    finally:
+        for handle in list(backend.pending):
+            backend.finish(handle, 2)
+        Gio.bus_unown_name(owner)
+
+
+if __name__ == "__main__":
+    main()

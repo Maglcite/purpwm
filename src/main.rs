@@ -4,6 +4,7 @@
 //! at native DRM resolution e.g. `2560x1600`) and nested Wayland/X11 window mode (`--winit`).
 
 pub mod bar;
+pub mod capture;
 pub mod config;
 pub mod cursor;
 pub mod help;
@@ -329,6 +330,10 @@ pub fn run_winit(
     let mut state = PurpState::new(dh, socket_name.clone(), initial_logical, !is_standalone);
     state.set_scale(scale);
     state.output = Some(output.clone());
+    let capture_path = state
+        .runtime_dir
+        .join(format!("purpwm-capture-{socket_name}.sock"));
+    let mut capture_server = capture::CaptureServer::bind(&capture_path)?;
     // Physical size and scale the wl_output / layout were last configured for.
     let mut applied_output = (initial_phys, scale);
 
@@ -341,9 +346,10 @@ pub fn run_winit(
         is_standalone
     );
 
-    // Ensure Wi-Fi and Bluetooth are enabled & connected, pre-warm Spotlight daemon,
-    // start built-in notification daemon, and run autostart
+    // Start session services, pre-warm Spotlight, and run autostart commands.
     if !no_autostart {
+        state.spawn_keyring();
+        state.spawn_screenshot_portal();
         state.ensure_network_and_bluetooth();
         state.spawn_spotlight_daemon();
         state.spawn_notification_daemon();
@@ -465,6 +471,8 @@ pub fn run_winit(
         let status_changed = state.bar.tick_status();
         let lock_changed = state.poll_lock_screen();
         let notif_changed = state.notifications.tick();
+        let portal_replies = capture_server.poll(state.is_locked());
+        let portal_capture = !portal_replies.is_empty();
 
         if had_winit_events
             || accepted_client
@@ -475,6 +483,7 @@ pub fn run_winit(
             || state.bar.is_dirty()
             || state.active_grab.is_some()
             || state.screenshot_request.is_some()
+            || portal_capture
         {
             needs_render = true;
         }
@@ -499,6 +508,7 @@ pub fn run_winit(
             }
             let full_damage = Rectangle::from_size(phys_size);
             let mut pending_capture = None;
+            let mut pending_portal_capture = None;
 
             {
                 let (renderer, mut framebuffer) = backend.bind()?;
@@ -514,6 +524,18 @@ pub fn run_winit(
                         Ok(mapping) => pending_capture = Some(mapping),
                         Err(err) => tracing::warn!("Screenshot capture failed: {}", err),
                     }
+                }
+                if portal_capture {
+                    pending_portal_capture = Some(
+                        start_capture(
+                            renderer,
+                            &framebuffer,
+                            phys_size,
+                            state.scale,
+                            ScreenshotRequest::Screen,
+                        )
+                        .map_err(|error| error.to_string()),
+                    );
                 }
             }
 
@@ -551,6 +573,17 @@ pub fn run_winit(
                     Ok((w, h, rgba)) => state.save_screenshot(w, h, rgba),
                     Err(err) => tracing::warn!("Screenshot capture failed: {}", err),
                 }
+            }
+            if let Some(mapping) = pending_portal_capture {
+                let result = if state.is_locked() {
+                    Err("session is locked".to_owned())
+                } else {
+                    mapping.and_then(|mapping| {
+                        finish_capture(backend.renderer(), &mapping)
+                            .map_err(|error| error.to_string())
+                    })
+                };
+                capture::deliver(portal_replies, result);
             }
         } else {
             // Idle throttling: sleep 8ms (~120Hz polling) when nothing changed,

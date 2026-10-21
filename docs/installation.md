@@ -35,6 +35,7 @@ The wizard offers:
 | Session defaults | `PREFIX/share/purpwm/session.conf` system; `$XDG_CONFIG_HOME/purpwm/session.conf` user |
 | Login session | System default `/usr/share/wayland-sessions/purpwm.desktop`; optional |
 | Lock PAM | Detects the distro auth/account stack; preserves an existing `purpwm` service |
+| Keyring login unlock | Off by default; `yes` adds GNOME Keyring hooks to login PAM (backed up) |
 | Dependencies | `none`, `build`, or `desktop` |
 | Terminal/Spotlight/font | Automatic detection or an executable/font path; Spotlight can be disabled |
 | Display | Scale `1.0`–`3.0`, native or explicit resolution, refresh rate (default `120` Hz) |
@@ -67,7 +68,8 @@ purpwm listed reliably on the login screen.
 ```
 
 Noninteractive installs default to `user`, no package installation, and no login
-session/PAM changes unless `--system` is selected. `--yes` aliases `--non-interactive`.
+session/PAM changes unless `--system` is selected. Login PAM is only touched with
+`--keyring-pam yes`. `--yes` aliases `--non-interactive`.
 `--no-build` uses the checkout's release binary (honoring `CARGO_TARGET_DIR`) unless
 `--binary` is supplied. Normal builds use Cargo's reported artifact path, including
 custom Cargo target directories. A first backup of an overwritten `session.conf` is
@@ -94,8 +96,9 @@ saved as `session.conf.bak`. Theme, layouts and keybindings remain compile-time 
 | Brightness keys | `brightnessctl`, or logind via `busctl` (no root needed) |
 | Media keys | `playerctl` |
 | System monitor | `btop` or `top` |
+| Flameshot bar button | `flameshot`, `xdg-desktop-portal`, `xdg-desktop-portal-gtk`, Python 3 / PyGObject / GTK 4; native `purpwm-portal` backend |
 | Polkit dialog | Python 3, PyGObject, GTK 4, `polkit` (GI typelibs `Polkit-1.0`, `PolkitAgent-1.0`) |
-| Keyring | `gnome-keyring-daemon` |
+| Keyring | `gnome-keyring`, Python 3, PyGObject and `libsecret`; optional `seahorse` manager, `gcr-4` SSH agent |
 | Status bar font | Any TTF from `FONT_PATHS` (JetBrains Mono, DejaVu Sans Mono, ...) |
 
 On Arch / CachyOS, for example:
@@ -103,7 +106,8 @@ On Arch / CachyOS, for example:
 ```bash
 sudo pacman -S --needed rust wayland libxkbcommon mesa libinput seatd gamescope \
     alacritty networkmanager bluez-utils pipewire wireplumber pavucontrol playerctl \
-    btop python-gobject gtk4 polkit gnome-keyring ttf-jetbrains-mono
+    btop python-gobject gtk4 polkit gnome-keyring libsecret gcr-4 seahorse \
+    flameshot xdg-desktop-portal xdg-desktop-portal-gtk ttf-jetbrains-mono
 ```
 
 ## Building
@@ -164,6 +168,8 @@ With the default directories this installs:
 | `/usr/local/bin/start-purpwm` | Session launcher (environment, keyring, D-Bus, gamescope) |
 | `/usr/local/bin/purpwm-wifi`, `purpwm-bt` | Wi-Fi / Bluetooth manager helpers |
 | `/usr/local/bin/purpwm-polkit-agent` | Themed polkit authentication dialog |
+| `/usr/local/bin/purpwm-keyring` | OS keyring startup, status, unlock and manager commands |
+| `/usr/local/bin/purpwm-portal` | Native Screenshot portal backend (registers itself per user at login) |
 | `/usr/local/share/purpwm/session.conf` | Selected session defaults |
 | `/etc/pam.d/purpwm` | Screen-lock authentication; created only if absent |
 | `/usr/share/wayland-sessions/purpwm.desktop` | Session entry shown by display managers |
@@ -171,7 +177,8 @@ With the default directories this installs:
 Choose **purpwm** on your display manager's session menu and log in.
 The older `sudo ./install-session.sh` entry point still installs a prebuilt release
 with system defaults; use `./install.sh` for the wizard and automatic builds.
-The installer never modifies your display manager's login PAM services.
+The installer only modifies your display manager's login PAM services when you opt in
+with `--keyring-pam yes` (see [OS keyring](#os-keyring)).
 
 ### What `start-purpwm` does
 
@@ -179,7 +186,8 @@ The installer never modifies your display manager's login PAM services.
    `${XDG_CONFIG_HOME:-~/.config}/purpwm/session.conf` when different.
 2. Sets `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and the usual Wayland session
    variables (`XDG_CURRENT_DESKTOP=purpwm`, `QT_QPA_PLATFORM`, `GDK_BACKEND`, `MOZ_ENABLE_WAYLAND`, ...).
-3. Starts `gnome-keyring-daemon` (secrets, pkcs11, ssh) and exports `SSH_AUTH_SOCK`.
+3. Initializes `gnome-keyring-daemon` (secrets, pkcs11), and starts the optional
+   `gcr-ssh-agent.socket` when no SSH agent is set. Exports `SSH_AUTH_SOCK`.
 4. Imports the environment into the systemd user session.
 5. Turns on networking, Wi-Fi and Bluetooth in the background. `--no-autostart` or
    `PURPWM_AUTOSTART=0` skips keyring startup, environment import, radios, and compositor helpers.
@@ -194,6 +202,71 @@ The installer never modifies your display manager's login PAM services.
 The installed session works after moving or deleting the source checkout.
 Edit `session.conf` to change terminal/Spotlight paths and display defaults without
 rebuilding; see [session settings](configuration.md#session-settings).
+
+### OS keyring
+
+Apps can store passwords and tokens through the standard Secret Service API.
+The compositor starts `purpwm-keyring start` unless `--no-autostart` is set, including
+when the binary is launched directly. This updates D-Bus activation with purpwm's
+Wayland display so password prompts appear inside the session.
+When PAM has created a login keyring and no default is selected yet, it uses the
+login keyring as the default. An existing default selection is preserved.
+
+To unlock the keyring at login, install with `./install.sh --keyring-pam yes` (the wizard
+also asks). This adds optional GNOME Keyring PAM hooks to the existing `greetd`, `login`
+and `passwd` services, preserving their authentication rules and saving the original
+files as `/etc/pam.d/<service>.purpwm-keyring.bak`. To configure only the keyring:
+
+```bash
+python3 scripts/configure-keyring-pam.py --check
+sudo python3 scripts/configure-keyring-pam.py
+```
+
+For another display manager, select its PAM service explicitly, for example
+`sudo python3 scripts/configure-keyring-pam.py --service sddm --service passwd`.
+The `/etc/pam.d/purpwm` screen-lock configuration is separate from login.
+
+Password login creates/unlocks the login keyring through PAM when its password
+matches the account password. Autologin or fingerprint login still requires a
+keyring password prompt. See [GNOME's PAM integration guide](https://wiki.gnome.org/Projects/GnomeKeyring/Pam).
+
+```bash
+purpwm-keyring status   # Shows keyring lock state, never saved secrets
+purpwm-keyring unlock   # Standard GNOME password/create-keyring dialog
+purpwm-keyring manage   # Opens Seahorse (Passwords and Keys), if installed
+```
+
+Changes to login PAM take effect on the next login. Existing keyrings are preserved;
+if their password differs from your login password, update it in Passwords and Keys.
+
+### Screenshot portal / Flameshot
+
+`purpwm-portal` implements the standard Screenshot backend (version 2) and is
+started by the compositor in a full session. It asks for screen-sharing permission,
+captures a full output through the compositor, and returns a PNG URI to the portal
+frontend. Flameshot uses this image for its selection and annotation UI. Locked
+sessions reject captures. Color picking and screen recording are not implemented.
+
+No root installation is needed for a checkout or `~/.local/bin` setup. The helper
+sets up a desktop-specific `~/.config/xdg-desktop-portal/purpwm-portals.conf`, a
+per-user D-Bus activation file, and a merged backend discovery directory under
+`~/.local/share/purpwm/portals`. Installed GTK and other desktop backends remain
+available. The session exports `XDG_DESKTOP_PORTAL_DIR` for this merged directory
+and refreshes the frontend once the backend is ready. A changed existing purpwm
+configuration is backed up with the `.bak` suffix.
+
+For manual setup, run `purpwm-portal --install` inside the session, then log out
+and back in after rebuilding. `--no-autostart` nested instances expose their own
+private capture socket but do not replace the desktop's active portal backend.
+Temporary portal PNGs are private files under `$XDG_RUNTIME_DIR/purpwm-screenshots`
+and expire after about an hour. They do not overwrite the clipboard or populate
+`~/Pictures/Screenshots`.
+
+Integration test (opens a temporary nested compositor and, if installed, Flameshot):
+
+```bash
+dbus-run-session -- env PURPWM_TEST_PRIVATE_BUS=1 python3 scripts/test_screenshot_portal.py
+```
 
 ## Updating
 

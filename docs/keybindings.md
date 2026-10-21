@@ -118,8 +118,14 @@ on the clipboard as `image/png`. Scripts can trigger one with `kill -USR1 $(pido
 | Tag `1..9` | View tag (`Shift`: move window there) | Toggle tag in view | Middle: move window there |
 | Layout symbol | Next layout | Previous layout | |
 | Title area | Focus next window | | Middle: open a terminal |
+| `Flameshot` button | Open Flameshot capture UI (`flameshot gui`) | | |
 | `WIFI` pill | Wi-Fi manager | Toggle Wi-Fi radio | |
 | `BT` pill | Bluetooth manager | Toggle Bluetooth power | |
 | `VOL` pill | Mute / unmute | Open mixer (`pavucontrol`) | Scroll: volume |
 | `BAT` / `CPU` / `MEM` / clock | System monitor | | |
 | Anywhere else | | | Scroll: switch tags |
+
+The Flameshot button appears beside Wi-Fi when space permits. The native
+`purpwm-portal` Screenshot backend supplies the captured frame. Approve the
+screen-sharing dialog, then select and annotate an area in Flameshot.
+`Print` continues to use the built-in screenshot capture directly.

@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Session keyring setup and Secret Service controls; never handles passwords."""
+
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+def import_environment():
+    names = [
+        name for name in (
+            "WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE",
+            "XDG_CURRENT_DESKTOP", "GDK_BACKEND", "GNOME_KEYRING_CONTROL",
+            "SSH_AUTH_SOCK",
+        ) if name in os.environ
+    ]
+    if shutil.which("dbus-update-activation-environment"):
+        subprocess.run(["dbus-update-activation-environment", "--systemd", *names],
+                       check=False)
+    elif shutil.which("systemctl"):
+        subprocess.run(["systemctl", "--user", "import-environment", *names],
+                       check=False)
+
+
+def start():
+    if not shutil.which("gnome-keyring-daemon"):
+        raise RuntimeError("Install gnome-keyring to enable the OS keyring.")
+    # Prompts are D-Bus activated: they must connect to purpwm's own display.
+    import_environment()
+    result = subprocess.run(
+        ["gnome-keyring-daemon", "--start", "--components=pkcs11,secrets"],
+        stdout=subprocess.PIPE, text=True, check=True,
+    )
+    for line in result.stdout.splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name in ("GNOME_KEYRING_CONTROL", "SSH_AUTH_SOCK"):
+            os.environ[name] = value.rstrip(";")
+    import_environment()
+    Secret, service = secret_service()
+    default = Secret.Collection.for_alias_sync(
+        service, "default", Secret.CollectionFlags.NONE, None,
+    )
+    if default is None:
+        login = Secret.Collection.for_alias_sync(
+            service, "login", Secret.CollectionFlags.NONE, None,
+        )
+        if login is not None:
+            service.set_alias_sync("default", login, None)
+
+
+def secret_service():
+    try:
+        import gi
+        gi.require_version("Secret", "1")
+        from gi.repository import Secret
+    except (ImportError, ValueError) as error:
+        raise RuntimeError("Install python-gobject and libsecret for keyring controls.") from error
+    service = Secret.Service.get_sync(Secret.ServiceFlags.LOAD_COLLECTIONS, None)
+    return Secret, service
+
+
+def status():
+    _, service = secret_service()
+    collections = service.get_collections()
+    print("Secret Service is available.")
+    for collection in collections:
+        state = "locked" if collection.get_locked() else "unlocked"
+        label = collection.get_label() or collection.get_object_path().rsplit("/", 1)[-1]
+        print(f"{label}: {state}")
+    if not collections:
+        print("No keyrings yet. Run purpwm-keyring unlock to create one.")
+
+
+def unlock():
+    Secret, service = secret_service()
+    collection = Secret.Collection.for_alias_sync(
+        service, "default", Secret.CollectionFlags.NONE, None,
+    )
+    if collection is None:
+        collection = Secret.Collection.for_alias_sync(
+            service, "login", Secret.CollectionFlags.NONE, None,
+        )
+    if collection is None:
+        collection = Secret.Collection.create_sync(
+            service, "Login", "default", Secret.CollectionCreateFlags.NONE, None,
+        )
+    if collection is None:
+        raise RuntimeError("Keyring creation was cancelled.")
+    if collection.get_locked():
+        # libsecret delegates the password dialog to GNOME's system prompter.
+        service.unlock_sync([collection], None)
+    # Reload the property rather than relying on delivery of a change signal.
+    from gi.repository import Gio, GLib
+    locked = service.get_connection().call_sync(
+        service.get_name(), collection.get_object_path(),
+        "org.freedesktop.DBus.Properties", "Get",
+        GLib.Variant("(ss)", ("org.freedesktop.Secret.Collection", "Locked")),
+        GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NONE, 5000, None,
+    ).unpack()[0]
+    if locked:
+        raise RuntimeError("Keyring remains locked (unlock was cancelled or failed).")
+    print("Keyring unlocked.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("start", "status", "unlock", "manage"),
+                        default="status", nargs="?")
+    args = parser.parse_args()
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    if "DBUS_SESSION_BUS_ADDRESS" not in os.environ and (runtime / "bus").exists():
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime / 'bus'}"
+    if args.action == "manage":
+        if not shutil.which("seahorse"):
+            raise RuntimeError("Install seahorse for the Passwords and Keys manager.")
+        os.execvp("seahorse", ["seahorse"])
+    globals()[args.action]()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"purpwm-keyring: {error}", file=sys.stderr)
+        sys.exit(1)

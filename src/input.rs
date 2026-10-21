@@ -594,6 +594,11 @@ impl PurpState {
                     self.set_layout(next);
                 }
             }
+            BarClickAction::Flameshot => {
+                if button == BTN_LEFT {
+                    self.spawn_flameshot();
+                }
+            }
             BarClickAction::Wifi => {
                 if button == BTN_RIGHT {
                     self.toggle_wifi_radio();

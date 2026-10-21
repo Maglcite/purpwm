@@ -143,8 +143,11 @@ absolute path) is started. Children get the session's `WAYLAND_DISPLAY`,
 | `BRIGHTNESS_UP/DOWN_COMMANDS` | Brightness keys (logind fallback if none found) |
 | `MEDIA_*_COMMANDS` | Media keys |
 | `POLKIT_COMMANDS` | Started once at login |
+| `KEYRING_COMMANDS` | Initializes the OS keyring and its D-Bus prompt environment at startup |
 | `AUTOSTART_COMMANDS` | Started once at login if installed (empty by default; the built-in notification daemon already owns the bus) |
 | `SCREENSHOT_DIR` | Screenshot folder, relative to `$HOME` |
+| `FLAMESHOT_COMMANDS` | `flameshot gui`, launched by the Flameshot status bar button |
+| `SCREENSHOT_PORTAL_COMMANDS` | Starts the native Screenshot portal and refreshes the desktop frontend |
 
 The launcher daemon is pre-started by `PurpState::spawn_spotlight_daemon` in
 [`src/state.rs`](../src/state.rs). It uses `PURPWM_SPOTLIGHT` or `spotlight` on `PATH`,
@@ -157,3 +160,5 @@ as does the toggle binding. Terminal and helper defaults also use `PATH`.
 | `purpwm-wifi` | Turns Wi-Fi on, rescans, and opens `nmtui` in a floating terminal (falls back to `nm-connection-editor` / COSMIC Settings) |
 | `purpwm-bt` | Terminal Bluetooth control centre: list, connect / disconnect, scan, pair & trust, power |
 | `purpwm-polkit-agent` | GTK 4 password dialog implementing the polkit authentication-agent D-Bus interface; retries on a wrong password and closes if the requester exits |
+| `purpwm-keyring` | Starts the Secret Service, reports lock state, unlocks/creates the default keyring, or opens Seahorse |
+| `purpwm-portal` | Screenshot portal adapter using the compositor's private framebuffer capture socket |

@@ -50,6 +50,15 @@ can be registered per login session, so another desktop's agent can block it.
 Tapping `Mod` runs the first available entry in `LAUNCHER_COMMANDS`. Make sure the
 path exists, or set `PURPWM_SPOTLIGHT` to its executable in your `session.conf`.
 
+**Apps cannot save passwords, or the keyring asks for a password every login**
+Run `purpwm-keyring status` inside the session, then `purpwm-keyring unlock` to
+open the standard keyring dialog. Install `gnome-keyring`, `libsecret` and
+`python-gobject` if missing. If no dialog appears, check that
+`/usr/lib/gcr-prompter` exists and run `purpwm-keyring start` inside purpwm to refresh
+the D-Bus display environment. For automatic unlock on password login, follow
+[OS keyring setup](installation.md#os-keyring); starting the daemon alone cannot
+unlock an encrypted keyring. Autologin requires a manual unlock.
+
 **Wi-Fi / Bluetooth pill says `N/A`**
 `nmcli` or `bluetoothctl` isn't installed, or NetworkManager / `bluetoothd` isn't running
 (`systemctl status NetworkManager bluetooth`).
@@ -62,6 +71,15 @@ Install `brightnessctl`, or check that logind accepts
 **Screenshots aren't on the clipboard after closing purpwm**
 The clipboard image is served by the compositor itself, so it lasts only while purpwm
 runs. The PNG file in `~/Pictures/Screenshots` stays.
+
+**Flameshot says it cannot capture the screen**
+Install `xdg-desktop-portal` and `xdg-desktop-portal-gtk` alongside Flameshot, then
+log back into the rebuilt purpwm session. Check `pgrep -fa purpwm-portal` and
+`journalctl --user -u xdg-desktop-portal.service`. The frontend must select
+`purpwm` for `org.freedesktop.impl.portal.Screenshot`. Run `purpwm-portal --install`
+to repair the per-user configuration; `purpwm-portal --session` starts the adapter
+and refreshes the frontend for the current display. An old compositor binary
+must be restarted before it can serve native portal capture requests.
 
 **The session won't start from the login screen**
 Standalone mode needs `gamescope`. Run `start-purpwm` from a TTY to see its errors, and

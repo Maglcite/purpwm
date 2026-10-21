@@ -213,6 +213,21 @@ pub const WINDOW_RULES: &[WindowRule] = &[
         is_floating: true,
         opacity: Some(0.96),
     },
+    // Flameshot's selection/annotation UI needs the captured pixels fully opaque.
+    WindowRule {
+        app_id_match: None,
+        title_match: Some("Screenshot — purpwm"),
+        tags: 0,
+        is_floating: true,
+        opacity: Some(1.0),
+    },
+    WindowRule {
+        app_id_match: Some("flameshot"),
+        title_match: None,
+        tags: 0,
+        is_floating: true,
+        opacity: Some(1.0),
+    },
     // Common utility / settings dialogs should float automatically
     WindowRule {
         app_id_match: Some("pavucontrol"),
@@ -420,8 +435,17 @@ pub const MEDIA_PREV_COMMANDS: &[&[&str]] = &[&["playerctl", "previous"]];
 /// under `$HOME/<SCREENSHOT_DIR>` and also offered on the clipboard as `image/png`.
 pub const SCREENSHOT_DIR: &str = "Pictures/Screenshots";
 
+/// Flameshot capture UI, opened by its status bar button.
+pub const FLAMESHOT_COMMANDS: &[&[&str]] = &[&["flameshot", "gui"]];
+
+/// Screenshot portal backend, started only for a full desktop session.
+pub const SCREENSHOT_PORTAL_COMMANDS: &[&[&str]] = &[&["purpwm-portal", "--session"]];
+
 /// Audio mixer commands tried in order when right-clicking the `VOL` status bar pill.
 pub const MIXER_COMMANDS: &[&[&str]] = &[&["pavucontrol"], &["cosmic-settings", "sound"]];
+
+/// Initialize the Secret Service and its D-Bus prompt environment at startup.
+pub const KEYRING_COMMANDS: &[&[&str]] = &[&["purpwm-keyring", "start"]];
 
 /// Polkit authentication agent commands tried in order.
 pub const POLKIT_COMMANDS: &[&[&str]] = &[&["purpwm-polkit-agent"]];

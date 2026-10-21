@@ -10,7 +10,7 @@ A small, `dwm`-inspired dynamic tiling **Wayland compositor** written in Rust on
 - **Native touch support**: full `wl_touch` forwarding, tap-to-focus windows, status-bar touch controls, and `Mod + Touch` window dragging.
 - **Built-in PAM lock screen**: `Mod + Shift + l` (or `Mod + Ctrl + l` / `kill -USR2`) locks the session with a full-screen purple PAM locker.
 - **Built-in notifications**: implements `org.freedesktop.Notifications` on D-Bus and renders translucent purple toast cards (click or tap to dismiss).
-- **Daily-driver bits**: clickable Wi-Fi / Bluetooth / volume pills, system metrics, media / volume / brightness keys, built-in screenshots, clipboard + `wlr-data-control`, `idle-inhibit`, drag-and-drop icons, popup menus, polkit authentication dialog.
+- **Daily-driver bits**: clickable Wi-Fi / Bluetooth / volume pills, system metrics, media / volume / brightness keys, built-in screenshots, clipboard + `wlr-data-control`, `idle-inhibit`, drag-and-drop icons, popup menus, polkit authentication dialog, [OS keyring with login unlock](docs/installation.md#os-keyring).
 - **Launcher integration**: tap `Mod` to open the Spotlight launcher (any `wlr-layer-shell` launcher works).
 - **Configured in code** like `dwm`'s `config.h`: edit [`src/config.rs`](src/config.rs) and rebuild.
 

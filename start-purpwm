@@ -59,11 +59,18 @@ export _JAVA_AWT_WM_NONREPARENTING=1
 # with VK_ERROR_SURFACE_LOST_KHR after a ~500ms timeout stall. Setting WGPU_BACKEND=gl eliminates this.
 export WGPU_BACKEND=gl
 
-# Unlock / attach gnome-keyring-daemon for Wi-Fi & secret storage
+# Initialize the daemon started by login PAM; --start alone does not unlock it.
 if [ "$AUTOSTART" != 0 ] && command -v gnome-keyring-daemon >/dev/null 2>&1; then
-    eval "$(gnome-keyring-daemon --start --components=pkcs11,secrets,ssh 2>/dev/null || true)"
+    eval "$(gnome-keyring-daemon --start --components=pkcs11,secrets || true)"
+    export GNOME_KEYRING_CONTROL
 fi
-if [ -S "$XDG_RUNTIME_DIR/gcr/ssh" ]; then
+# SSH moved out of gnome-keyring into gcr; keep any existing agent.
+if [ "$AUTOSTART" != 0 ] && [ -z "$SSH_AUTH_SOCK" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --user start gcr-ssh-agent.socket 2>/dev/null || true
+fi
+if [ -n "$SSH_AUTH_SOCK" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+    :
+elif [ -S "$XDG_RUNTIME_DIR/gcr/ssh" ]; then
     export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/gcr/ssh"
 elif [ -S "$XDG_RUNTIME_DIR/keyring/ssh" ]; then
     export SSH_AUTH_SOCK="$XDG_RUNTIME_DIR/keyring/ssh"
@@ -71,7 +78,7 @@ fi
 
 # Import environment into systemd user session
 if [ "$AUTOSTART" != 0 ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl --user import-environment XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DBUS_SESSION_BUS_ADDRESS SSH_AUTH_SOCK PATH WGPU_BACKEND 2>/dev/null || true
+    systemctl --user import-environment XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DBUS_SESSION_BUS_ADDRESS GNOME_KEYRING_CONTROL SSH_AUTH_SOCK PATH WGPU_BACKEND 2>/dev/null || true
 fi
 
 # Ensure Wi-Fi and Bluetooth are active on session login.
