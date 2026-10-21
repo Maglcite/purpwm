@@ -20,8 +20,8 @@ mod tests {
             PurpState, ResizeEdges,
         },
         wm::{
-            centered_side_widths, master_stack_widths, scratchpad_geo, split_lengths, LayoutMode,
-            Workspace,
+            centered_side_widths, master_stack_widths, scratchpad_geo, split_lengths,
+            split_weighted, LayoutMode, Workspace,
         },
     };
 
@@ -330,6 +330,99 @@ mod tests {
         assert!(pad.loc.x >= 0 && pad.loc.y >= BAR_HEIGHT);
         assert!(pad.loc.x + pad.size.w <= 200);
         assert!(pad.loc.y + pad.size.h <= 180);
+    }
+
+    #[test]
+    fn test_weighted_column_split_keeps_the_span() {
+        let even = split_weighted(100, &[1.0, 1.0, 1.0], 6);
+        assert_eq!(even, split_lengths(100, 3, 6));
+        let uneven = split_weighted(100, &[3.0, 1.0], 4);
+        assert_eq!(uneven.span(), 100);
+        assert_eq!(uneven.lengths, vec![72, 24]);
+    }
+
+    #[test]
+    fn test_resizing_tiled_windows_moves_the_splits() {
+        let rect =
+            |x, y, w, h| Rectangle::<i32, Logical>::new(Point::from((x, y)), Size::from((w, h)));
+        let edges = |left, top, right, bottom| ResizeEdges {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        // Usable area (10, 10) 980x950 with 10px gaps.
+        let output = Size::from((1000, 970));
+        let mut ws = Workspace {
+            show_bar: false,
+            gap_outer: 10,
+            gap_inner: 10,
+            ..Workspace::default()
+        };
+        // `[]=` with a master and two stacked windows on the right.
+        let tiled = [
+            (0, rect(10, 10, 534, 950), 1.0),
+            (1, rect(554, 10, 436, 470), 1.0),
+            (2, rect(554, 490, 436, 470), 1.0),
+        ];
+        let start = ws.mfact();
+
+        // Dragging the master's right edge (or its screen edge) moves the master/stack divider.
+        for e in [
+            edges(false, false, true, false),
+            edges(true, false, false, false),
+        ] {
+            let split = ws
+                .plan_tiled_resize(output, &tiled, 0, e)
+                .mfact
+                .expect("master divider");
+            assert_eq!(split.grow, 1);
+            assert!((split.start + split.per_px * 97.0 - (start + 0.1)).abs() < 1e-4);
+        }
+        // The stack's left edge is the same divider, and it does not touch the rows.
+        let stack = ws.plan_tiled_resize(output, &tiled, 1, edges(true, false, false, false));
+        assert_eq!(stack.mfact.expect("stack divider").grow, -1);
+        assert!(stack.rows.is_none());
+
+        // Bottom edge of the upper stack window: the row divider follows the pointer and
+        // the windows keep their minimum height.
+        let rows = ws
+            .plan_tiled_resize(output, &tiled, 1, edges(false, false, false, true))
+            .rows
+            .expect("row divider");
+        assert_eq!((rows.upper, rows.lower, rows.grow), (1, 2, 1));
+        let (upper, lower) = rows.cfacts(100);
+        assert!((upper * rows.px_per_cfact - 570.0).abs() < 0.01);
+        assert!((upper + lower - 2.0).abs() < 1e-4);
+        let (_, lower) = rows.cfacts(10_000);
+        assert!((lower * rows.px_per_cfact - 80.0).abs() < 0.01);
+        // The last window in a column has no lower neighbour: use the divider above it.
+        let last = ws
+            .plan_tiled_resize(output, &tiled, 2, edges(false, false, false, true))
+            .rows
+            .expect("row above");
+        assert_eq!((last.upper, last.lower, last.grow), (1, 2, -1));
+        // A lone column window has no row divider.
+        assert!(ws
+            .plan_tiled_resize(output, &tiled, 0, edges(false, true, false, false))
+            .rows
+            .is_none());
+
+        // `|M|` with stacks on both sides: the left divider grows the master when dragged left.
+        ws.set_layout(LayoutMode::CenteredMaster);
+        let centered = [
+            (0, rect(10, 10, 200, 950), 1.0),
+            (1, rect(220, 10, 560, 950), 1.0),
+            (2, rect(790, 10, 200, 950), 1.0),
+        ];
+        let left = ws.plan_tiled_resize(output, &centered, 0, edges(false, false, true, false));
+        assert!(left.mfact.expect("left divider").per_px < 0.0);
+        let right = ws.plan_tiled_resize(output, &centered, 1, edges(false, false, true, false));
+        assert!(right.mfact.expect("right divider").per_px > 0.0);
+
+        ws.set_layout(LayoutMode::Monocle);
+        let monocle = ws.plan_tiled_resize(output, &tiled, 0, edges(false, false, true, true));
+        assert!(monocle.mfact.is_none() && monocle.rows.is_none());
     }
 
     #[test]

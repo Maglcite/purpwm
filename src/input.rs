@@ -519,6 +519,16 @@ impl PurpState {
             return false;
         };
         let (surface, start_pointer, start_geo, edges) = match grab {
+            InteractiveGrab::TiledResize {
+                start_pointer,
+                plan,
+                ..
+            } => {
+                let dx = (position.x - start_pointer.x).round() as i32;
+                let dy = (position.y - start_pointer.y).round() as i32;
+                self.apply_tiled_resize(&plan, dx, dy);
+                return true;
+            }
             InteractiveGrab::Move {
                 surface,
                 start_pointer,
@@ -847,6 +857,29 @@ impl PurpState {
                 if button == BTN_MIDDLE {
                     self.toggle_floating_focused();
                     return;
+                }
+                if button == BTN_RIGHT {
+                    // Resize a tiled window from the edges nearest the pointer by moving
+                    // the splits beside it, instead of popping it out to float.
+                    let geo = self.windows[idx].geo.to_f64();
+                    let right = pos.x >= geo.loc.x + geo.size.w / 2.0;
+                    let bottom = pos.y >= geo.loc.y + geo.size.h / 2.0;
+                    let edges = crate::state::ResizeEdges {
+                        left: !right,
+                        top: !bottom,
+                        right,
+                        bottom,
+                    };
+                    if let Some(plan) = self.tiled_resize_plan(idx, edges) {
+                        self.touch_grab_slot = None;
+                        self.active_grab = Some(InteractiveGrab::TiledResize {
+                            start_pointer: pos,
+                            plan,
+                            forward_release: false,
+                        });
+                        self.relayout();
+                        return;
+                    }
                 }
                 let w = &mut self.windows[idx];
                 if !w.is_floating && !w.is_scratchpad {

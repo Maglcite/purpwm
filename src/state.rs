@@ -109,7 +109,7 @@ use crate::{
     help::HelpOverlay,
     lock::{LockPoll, LockScreen},
     notify::NotificationCenter,
-    wm::{scratchpad_geo, LayoutMode, ManagedWindow, Workspace},
+    wm::{scratchpad_geo, LayoutMode, ManagedWindow, TiledResize, Workspace},
 };
 
 /// Which edges of a window a resize grab pulls. A left or top edge moves the
@@ -201,6 +201,8 @@ pub(crate) fn wifi_needs_autoconnect(nmcli_type_state: &str) -> bool {
 
 /// Active mouse or touch drag operation (`Mod + Left-Drag` / `Mod + Touch-Drag` to move,
 /// `Mod + Right-Drag` to resize, or client-initiated `xdg_toplevel.move`/`resize`).
+/// Resizing a tiled window is a `TiledResize`: it moves the layout splits and keeps
+/// the window tiled.
 /// Tracks the window by surface because window indices shift when windows map or unmap.
 /// `forward_release` is set when the client already received the button/touch down
 /// (an `xdg_toplevel` move/resize request) and still needs the matching up event.
@@ -219,14 +221,25 @@ pub enum InteractiveGrab {
         edges: ResizeEdges,
         forward_release: bool,
     },
+    TiledResize {
+        start_pointer: Point<f64, Logical>,
+        plan: TiledResize<WlSurface>,
+        forward_release: bool,
+    },
 }
 
 impl InteractiveGrab {
     pub(crate) fn forward_release(&self) -> bool {
         match self {
-            Self::Move { forward_release, .. } | Self::Resize { forward_release, .. } => {
-                *forward_release
+            Self::Move {
+                forward_release, ..
             }
+            | Self::Resize {
+                forward_release, ..
+            }
+            | Self::TiledResize {
+                forward_release, ..
+            } => *forward_release,
         }
     }
 }
@@ -953,12 +966,20 @@ impl PurpState {
         self.relayout();
     }
 
-    /// Resize the focused window with `Mod + Shift + Arrow` keys (automatically floats if tiled).
+    /// Resize the focused window with `Mod + Shift + Arrow` keys. A tiled window stays tiled:
+    /// the master/stack split and its neighbour in the column give way.
     pub fn resize_focused_window(&mut self, dw: i32, dh: i32) {
         let Some(focused) = self.focused_idx else {
             return;
         };
         if focused >= self.windows.len() {
+            return;
+        }
+
+        if let Some(plan) = self.tiled_resize_plan(focused, ResizeEdges::BOTTOM_RIGHT) {
+            let dx = dw * RESIZE_STEP * plan.mfact.map_or(0, |m| m.grow);
+            let dy = dh * RESIZE_STEP * plan.rows.as_ref().map_or(0, |r| r.grow);
+            self.apply_tiled_resize(&plan, dx, dy);
             return;
         }
 
@@ -974,6 +995,46 @@ impl PurpState {
         ));
         w.float_geo.size = w.clamp_frame_to_client_limits(wanted);
         w.geo = w.float_geo;
+        self.relayout();
+    }
+
+    /// How resizing window `idx` at `edges` moves the tiling splits, or `None` when
+    /// the window is not tiled (floating windows and the `><>` layout resize freely).
+    pub(crate) fn tiled_resize_plan(
+        &self,
+        idx: usize,
+        edges: ResizeEdges,
+    ) -> Option<TiledResize<WlSurface>> {
+        let tiled_indices = self.workspace.tiled_indices(&self.windows);
+        if self.workspace.layout() == LayoutMode::Floating || !tiled_indices.contains(&idx) {
+            return None;
+        }
+        let tiled: Vec<_> = tiled_indices
+            .iter()
+            .map(|&i| (i, self.windows[i].geo, self.windows[i].cfact))
+            .collect();
+        let plan = self
+            .workspace
+            .plan_tiled_resize(self.output_size, &tiled, idx, edges);
+        Some(plan.map(|i| self.windows[i].wl_surface().clone()))
+    }
+
+    /// Move the splits in `plan` by `dx`/`dy` logical pixels from where they started.
+    pub(crate) fn apply_tiled_resize(&mut self, plan: &TiledResize<WlSurface>, dx: i32, dy: i32) {
+        if let Some(split) = plan.mfact {
+            self.workspace
+                .set_mfact(split.start + split.per_px * dx as f32);
+        }
+        if let Some(rows) = &plan.rows {
+            let (upper, lower) = rows.cfacts(dy);
+            for w in &mut self.windows {
+                if w.wl_surface() == &rows.upper {
+                    w.cfact = upper;
+                } else if w.wl_surface() == &rows.lower {
+                    w.cfact = lower;
+                }
+            }
+        }
         self.relayout();
     }
 
@@ -1702,6 +1763,19 @@ impl PurpState {
             .map(|(_, pos)| pos)
             .unwrap_or(self.pointer_location);
         self.touch_grab_slot = active_touch.map(|(slot, _)| slot);
+
+        // Dragging a tiled window's edge moves the split next to it; the window stays tiled.
+        if let Some(edge) = edges {
+            if let Some(plan) = self.tiled_resize_plan(idx, resize_edges_from_request(edge)) {
+                self.active_grab = Some(InteractiveGrab::TiledResize {
+                    start_pointer,
+                    plan,
+                    forward_release: true,
+                });
+                self.relayout();
+                return;
+            }
+        }
 
         let w = &mut self.windows[idx];
         if !w.is_floating && !w.is_scratchpad {

@@ -88,6 +88,9 @@ pub struct ManagedWindow {
     /// rule matches or both strings are known, so a title that arrives after
     /// `app_id` can still match.
     pub rule_seen: (String, String),
+    /// Height weight inside its tiled column (`dwm` `cfacts`); resizing a tiled
+    /// window moves the split between it and its neighbour by changing these.
+    pub cfact: f32,
 }
 
 impl ManagedWindow {
@@ -113,6 +116,7 @@ impl ManagedWindow {
             size_from_client: false,
             client_sized_once: false,
             rule_seen: (String::new(), String::new()),
+            cfact: 1.0,
         }
     }
 
@@ -328,6 +332,91 @@ pub(crate) fn split_lengths(total: i32, count: usize, gap: i32) -> LengthSplit {
     LengthSplit { gap, lengths }
 }
 
+/// Like [`split_lengths`], but each part's share of the space follows its weight.
+pub(crate) fn split_weighted(total: i32, weights: &[f32], gap: i32) -> LengthSplit {
+    let mut split = split_lengths(total, weights.len(), gap);
+    if weights.windows(2).all(|pair| pair[0] == pair[1]) {
+        return split;
+    }
+    let weights: Vec<f64> = weights.iter().map(|w| f64::from(w.max(0.05))).collect();
+    let sum: f64 = weights.iter().sum();
+    let avail = f64::from(split.lengths.iter().sum::<i32>());
+    let mut acc = 0.0;
+    let mut prev = 0;
+    for (len, weight) in split.lengths.iter_mut().zip(&weights) {
+        acc += weight;
+        let edge = (avail * acc / sum).round() as i32;
+        *len = edge - prev;
+        prev = edge;
+    }
+    split
+}
+
+/// Smallest height a row resize leaves a tiled window.
+const MIN_TILED_ROW: i32 = 80;
+
+/// The master/stack divider a tiled resize moves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MfactSplit {
+    /// `mfact` when the resize started.
+    pub start: f32,
+    /// `mfact` change per logical pixel the divider moves right.
+    pub per_px: f32,
+    /// `1` if moving the divider right grows the resized window, else `-1`.
+    pub grow: i32,
+}
+
+/// The divider between two neighbours in one tiled column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowSplit<T> {
+    pub upper: T,
+    pub lower: T,
+    pub upper_h: i32,
+    pub lower_h: i32,
+    /// Pixels of height per unit of `cfact` in this column.
+    pub px_per_cfact: f32,
+    /// `1` if moving the divider down grows the resized window, else `-1`.
+    pub grow: i32,
+}
+
+impl<T> RowSplit<T> {
+    /// `(upper cfact, lower cfact)` once the divider has moved `dy` pixels down.
+    pub fn cfacts(&self, dy: i32) -> (f32, f32) {
+        let lo = (MIN_TILED_ROW - self.upper_h).min(0);
+        let hi = (self.lower_h - MIN_TILED_ROW).max(0);
+        let d = dy.clamp(lo, hi);
+        (
+            (self.upper_h + d) as f32 / self.px_per_cfact,
+            (self.lower_h - d) as f32 / self.px_per_cfact,
+        )
+    }
+}
+
+/// Resizing a tiled window moves the splits beside it instead of floating it:
+/// horizontal motion moves the master/stack divider, vertical motion the divider
+/// to its neighbour in the same column. Each divider follows the pointer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TiledResize<T> {
+    pub mfact: Option<MfactSplit>,
+    pub rows: Option<RowSplit<T>>,
+}
+
+impl<T> TiledResize<T> {
+    pub fn map<U>(self, mut f: impl FnMut(T) -> U) -> TiledResize<U> {
+        TiledResize {
+            mfact: self.mfact,
+            rows: self.rows.map(|r| RowSplit {
+                upper: f(r.upper),
+                lower: f(r.lower),
+                upper_h: r.upper_h,
+                lower_h: r.lower_h,
+                px_per_cfact: r.px_per_cfact,
+                grow: r.grow,
+            }),
+        }
+    }
+}
+
 /// `(master, stack, gap)` widths that add up to `usable_w`.
 pub(crate) fn master_stack_widths(usable_w: i32, gap: i32, mfact: f32) -> (i32, i32, i32) {
     let usable_w = usable_w.max(0);
@@ -447,8 +536,11 @@ impl Workspace {
     }
 
     pub fn adjust_mfact(&mut self, delta: f32) {
-        let cur = &mut self.pertag[self.cur_tag];
-        cur.mfact = (cur.mfact + delta).clamp(0.10, 0.90);
+        self.set_mfact(self.mfact() + delta);
+    }
+
+    pub fn set_mfact(&mut self, mfact: f32) {
+        self.pertag[self.cur_tag].mfact = mfact.clamp(0.10, 0.90);
     }
 
     pub fn adjust_nmaster(&mut self, delta: isize) {
@@ -482,26 +574,31 @@ impl Workspace {
         }
     }
 
-    /// Compute geometries for all visible windows on the current tags, just like `arrange()` in `dwm`.
-    pub fn arrange(
-        &self,
-        windows: &mut [ManagedWindow],
-        focused_idx: Option<usize>,
-        output_size: Size<i32, Logical>,
-    ) {
+    /// Gap between tiled windows, or 0 while gaps are off.
+    pub fn inner_gap(&self) -> i32 {
+        if self.gaps_enabled {
+            self.gap_inner
+        } else {
+            0
+        }
+    }
+
+    /// The area tiled windows are laid out in: below the bar, inside the outer gaps.
+    pub fn usable_area(&self, output_size: Size<i32, Logical>) -> Rectangle<i32, Logical> {
         let bar_y = if self.show_bar { BAR_HEIGHT } else { 0 };
         let g_outer = if self.gaps_enabled { self.gap_outer } else { 0 };
-        let g_inner = if self.gaps_enabled { self.gap_inner } else { 0 };
-
-        let usable = Rectangle::<i32, Logical>::new(
+        Rectangle::new(
             Point::from((g_outer, bar_y + g_outer)),
             Size::from((
                 (output_size.w - 2 * g_outer).max(1),
                 (output_size.h - bar_y - 2 * g_outer).max(1),
             )),
-        );
+        )
+    }
 
-        let tiled_indices: Vec<usize> = windows
+    /// Indices of the windows the current layout tiles, in tile order.
+    pub fn tiled_indices(&self, windows: &[ManagedWindow]) -> Vec<usize> {
+        windows
             .iter()
             .enumerate()
             .filter(|(_, w)| {
@@ -511,7 +608,119 @@ impl Workspace {
                     && !w.is_scratchpad
             })
             .map(|(i, _)| i)
-            .collect();
+            .collect()
+    }
+
+    /// Whether centred-master currently has stack columns on both sides of the master.
+    pub fn centered_sides(&self, tiled_count: usize) -> bool {
+        let nmaster = self.nmaster().min(tiled_count);
+        self.layout() == LayoutMode::CenteredMaster && nmaster > 0 && tiled_count - nmaster >= 2
+    }
+
+    /// Plan a resize of tiled window `target` grabbed at `edges`. `tiled` holds every
+    /// tiled window as `(index, frame, cfact)`.
+    pub(crate) fn plan_tiled_resize(
+        &self,
+        output_size: Size<i32, Logical>,
+        tiled: &[(usize, Rectangle<i32, Logical>, f32)],
+        target: usize,
+        edges: crate::state::ResizeEdges,
+    ) -> TiledResize<usize> {
+        let layout = self.layout();
+        let centered_sides = self.centered_sides(tiled.len());
+        let usable = self.usable_area(output_size);
+        let gap = self.inner_gap();
+        let mut plan = TiledResize {
+            mfact: None,
+            rows: None,
+        };
+        let Some(&(_, geo, _)) = tiled.iter().find(|(i, _, _)| *i == target) else {
+            return plan;
+        };
+        if matches!(layout, LayoutMode::Monocle | LayoutMode::Floating) {
+            return plan;
+        }
+
+        // Prefer the grabbed edge; at the screen edge use the window's other side.
+        if matches!(layout, LayoutMode::Tile | LayoutMode::CenteredMaster)
+            && (edges.left || edges.right)
+        {
+            let left = geo.loc.x;
+            let right = geo.loc.x + geo.size.w;
+            let inside = |x: i32| x > usable.loc.x && x < usable.loc.x + usable.size.w;
+            let picked = if edges.right {
+                [right, left]
+            } else {
+                [left, right]
+            }
+            .into_iter()
+            .find(|&x| inside(x));
+            if let Some(divider) = picked {
+                let grow = if divider == right { 1 } else { -1 };
+                let per_px = if centered_sides {
+                    let inner = (usable.size.w - 2 * gap).max(1) as f32;
+                    let toward_master = if divider * 2 < usable.loc.x * 2 + usable.size.w {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    toward_master * 2.0 / inner
+                } else {
+                    1.0 / (usable.size.w - gap).max(1) as f32
+                };
+                plan.mfact = Some(MfactSplit {
+                    start: self.mfact(),
+                    per_px,
+                    grow,
+                });
+            }
+        }
+
+        if edges.top || edges.bottom {
+            let mut column: Vec<_> = tiled
+                .iter()
+                .filter(|(_, g, _)| g.loc.x == geo.loc.x && g.size.w == geo.size.w)
+                .copied()
+                .collect();
+            column.sort_by_key(|(_, g, _)| g.loc.y);
+            let pos = column.iter().position(|(i, _, _)| *i == target);
+            let pair = pos.and_then(|pos| {
+                let above = pos.checked_sub(1).map(|p| (p, pos));
+                let below = (pos + 1 < column.len()).then_some((pos, pos + 1));
+                if edges.bottom {
+                    below.or(above)
+                } else {
+                    above.or(below)
+                }
+            });
+            if let Some((up, low)) = pair {
+                let heights: i32 = column.iter().map(|(_, g, _)| g.size.h).sum();
+                let weights: f32 = column.iter().map(|(_, _, c)| c.max(0.05)).sum();
+                let (upper, upper_geo, _) = column[up];
+                let (lower, lower_geo, _) = column[low];
+                plan.rows = Some(RowSplit {
+                    upper,
+                    lower,
+                    upper_h: upper_geo.size.h,
+                    lower_h: lower_geo.size.h,
+                    px_per_cfact: heights as f32 / weights,
+                    grow: if upper == target { 1 } else { -1 },
+                });
+            }
+        }
+        plan
+    }
+
+    /// Compute geometries for all visible windows on the current tags, just like `arrange()` in `dwm`.
+    pub fn arrange(
+        &self,
+        windows: &mut [ManagedWindow],
+        focused_idx: Option<usize>,
+        output_size: Size<i32, Logical>,
+    ) {
+        let g_inner = self.inner_gap();
+        let usable = self.usable_area(output_size);
+        let tiled_indices = self.tiled_indices(windows);
 
         let n = tiled_indices.len();
         let layout = self.layout();
@@ -721,7 +930,8 @@ impl Workspace {
         if count == 0 {
             return;
         }
-        let split = split_lengths(total_h, count, gap_inner);
+        let weights: Vec<f32> = indices.iter().map(|&i| windows[i].cfact).collect();
+        let split = split_weighted(total_h, &weights, gap_inner);
         let mut cur_y = y;
 
         for (pos, &win_idx) in indices.iter().enumerate() {

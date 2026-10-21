@@ -36,7 +36,7 @@ While locked, type your password and press `Enter` to unlock (`BackSpace` delete
 | `Mod + j` / `Mod + k` | Focus next / previous window |
 | `Mod + Shift + Return` | Zoom: swap the focused window with the master (on the master: with the next window) |
 | `Mod + Arrow` | Move the window: swap in the tiled stack, or nudge 40 px when floating |
-| `Mod + Shift + Arrow` | Resize by 40 px (floats the window) |
+| `Mod + Shift + Arrow` | Resize by 40 px (a tiled window stays tiled: its neighbours give way) |
 | `Mod + Shift + Space` | Toggle floating |
 | `Mod + Shift + f` / `F11` | Toggle fullscreen |
 | `Mod + o` | Toggle 100 % opaque mode (for video, photos) |
@@ -105,7 +105,7 @@ on the clipboard as `image/png`. Scripts can trigger one with `kill -USR1 $(pido
 | Action | Effect |
 | :--- | :--- |
 | `Mod + Left-drag` / `Mod + Touch-drag` | Move a window (floats it) |
-| `Mod + Right-drag` | Resize a window (floats it) |
+| `Mod + Right-drag` | Resize a window (a tiled window stays tiled: the splits nearest the pointer follow it) |
 | `Mod + Middle-click` | Toggle floating |
 | Tap window / overlay / popup | Focus the surface and forward native `wl_touch` events |
 | Tap status bar pill / tag | Trigger the corresponding status bar action |
