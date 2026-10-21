@@ -131,34 +131,66 @@ fn print_usage() {
     );
 }
 
+/// Prefer an internal panel over whichever connected connector sorts first.
+/// `connectors` is `(sysfs name, first mode line)`.
+pub(crate) fn pick_preferred_mode(connectors: &[(&str, &str)]) -> Option<(u32, u32)> {
+    fn internal(name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        name.contains("edp") || name.contains("lvds") || name.contains("dsi")
+    }
+    fn parse(mode: &str) -> Option<(u32, u32)> {
+        let (w, h) = mode.trim().split_once('x')?;
+        let (w, h) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
+        (w >= 640 && h >= 480).then_some((w, h))
+    }
+    let mut external = None;
+    for (name, mode) in connectors {
+        let Some(size) = parse(mode) else {
+            continue;
+        };
+        if internal(name) {
+            return Some(size);
+        }
+        if external.is_none() {
+            external = Some(size);
+        }
+    }
+    external
+}
+
 /// Detect the primary connected display's native resolution from `/sys/class/drm/card*-*/modes`.
 /// Falls back to `(2560, 1600)` if no DRM sysfs mode entry is readable.
 pub fn detect_preferred_resolution() -> (u32, u32) {
+    let mut connectors = Vec::new();
     if let Ok(entries) = fs::read_dir("/sys/class/drm") {
         let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
         paths.sort();
         for path in paths {
-            let status_path = path.join("status");
-            let modes_path = path.join("modes");
-            if let Ok(status) = fs::read_to_string(&status_path) {
-                if status.trim() == "connected" {
-                    if let Ok(modes) = fs::read_to_string(&modes_path) {
-                        if let Some(first_mode) = modes.lines().next() {
-                            if let Some((w_str, h_str)) = first_mode.trim().split_once('x') {
-                                if let (Ok(w), Ok(h)) = (w_str.parse::<u32>(), h_str.parse::<u32>())
-                                {
-                                    if w >= 640 && h >= 480 {
-                                        return (w, h);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            let Ok(status) = fs::read_to_string(path.join("status")) else {
+                continue;
+            };
+            if status.trim() != "connected" {
+                continue;
             }
+            let Ok(modes) = fs::read_to_string(path.join("modes")) else {
+                continue;
+            };
+            let Some(first_mode) = modes.lines().next() else {
+                continue;
+            };
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            connectors.push((name, first_mode.trim().to_string()));
         }
     }
-    (2560, 1600)
+    let borrowed: Vec<(&str, &str)> = connectors
+        .iter()
+        .map(|(name, mode)| (name.as_str(), mode.as_str()))
+        .collect();
+    pick_preferred_mode(&borrowed).unwrap_or((2560, 1600))
 }
 
 /// Logical (layout) size of the output for a physical window size at `scale`.

@@ -103,30 +103,132 @@ use crate::{
         MEDIA_PLAY_COMMANDS, MEDIA_PREV_COMMANDS, MIC_MUTE_COMMANDS, MIXER_COMMANDS, MOVE_STEP,
         POLKIT_COMMANDS, RESIZE_STEP, SCALE_MAX, SCALE_MIN, SCALE_STEP, SCREENSHOT_DIR,
         SYSTEM_MONITOR_COMMANDS, TAGMASK, TERMINAL_COMMANDS, VOL_DOWN_COMMANDS, VOL_MUTE_COMMANDS,
-        VOL_UP_COMMANDS, WIFI_COMMANDS, WINDOW_RULES,
+        VOL_UP_COMMANDS, WIFI_COMMANDS, WINDOW_RULES, window_rules_settled,
     },
     cursor::CursorTheme,
     help::HelpOverlay,
     lock::{LockPoll, LockScreen},
     notify::NotificationCenter,
-    wm::{LayoutMode, ManagedWindow, Workspace},
+    wm::{scratchpad_geo, LayoutMode, ManagedWindow, Workspace},
 };
+
+/// Which edges of a window a resize grab pulls. A left or top edge moves the
+/// origin so the opposite edge stays put.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeEdges {
+    pub left: bool,
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+}
+
+impl ResizeEdges {
+    pub const BOTTOM_RIGHT: Self = Self {
+        left: false,
+        top: false,
+        right: true,
+        bottom: true,
+    };
+}
+
+/// Apply `dx`/`dy` (pointer movement since the grab started) to `start`.
+/// `min_w` / `min_h` are the smallest frame size; the caller may still clamp
+/// to the client's size hints afterwards.
+pub(crate) fn resize_rect(
+    start: Rectangle<i32, Logical>,
+    dx: i32,
+    dy: i32,
+    edges: ResizeEdges,
+    min_w: i32,
+    min_h: i32,
+) -> Rectangle<i32, Logical> {
+    let mut x = start.loc.x;
+    let mut y = start.loc.y;
+    let mut w = start.size.w;
+    let mut h = start.size.h;
+    if edges.left {
+        let new_w = (start.size.w - dx).max(min_w);
+        x = start.loc.x + start.size.w - new_w;
+        w = new_w;
+    } else if edges.right {
+        w = (start.size.w + dx).max(min_w);
+    }
+    if edges.top {
+        let new_h = (start.size.h - dy).max(min_h);
+        y = start.loc.y + start.size.h - new_h;
+        h = new_h;
+    } else if edges.bottom {
+        h = (start.size.h + dy).max(min_h);
+    }
+    Rectangle::new(Point::from((x, y)), Size::from((w, h)))
+}
+
+/// After swapping the focused window with `target`, which index should stay focused.
+/// Zooming the master focuses the window that moved into the master slot (still at
+/// `focused`). Zooming any other window focuses it in its new master slot (`target`).
+pub(crate) fn focus_after_zoom(master: usize, focused: usize, target: usize) -> usize {
+    if master == focused {
+        focused
+    } else {
+        target
+    }
+}
+
+/// `nmcli -t -f TYPE,STATE device status`: connect only when a wifi device exists
+/// and none of them are already connected or connecting. A second, disconnected
+/// adapter must not kick `wlan0` off a live network.
+pub(crate) fn wifi_needs_autoconnect(nmcli_type_state: &str) -> bool {
+    let mut saw_wifi = false;
+    let mut busy = false;
+    for line in nmcli_type_state.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, ':');
+        let kind = parts.next().unwrap_or("");
+        let state = parts.next().unwrap_or("").trim();
+        if kind != "wifi" {
+            continue;
+        }
+        saw_wifi = true;
+        if state.starts_with("connect") {
+            busy = true;
+        }
+    }
+    saw_wifi && !busy
+}
 
 /// Active mouse or touch drag operation (`Mod + Left-Drag` / `Mod + Touch-Drag` to move,
 /// `Mod + Right-Drag` to resize, or client-initiated `xdg_toplevel.move`/`resize`).
 /// Tracks the window by surface because window indices shift when windows map or unmap.
+/// `forward_release` is set when the client already received the button/touch down
+/// (an `xdg_toplevel` move/resize request) and still needs the matching up event.
 #[derive(Debug, Clone)]
 pub enum InteractiveGrab {
     Move {
         surface: WlSurface,
         start_pointer: Point<f64, Logical>,
         start_geo: Rectangle<i32, Logical>,
+        forward_release: bool,
     },
     Resize {
         surface: WlSurface,
         start_pointer: Point<f64, Logical>,
         start_geo: Rectangle<i32, Logical>,
+        edges: ResizeEdges,
+        forward_release: bool,
     },
+}
+
+impl InteractiveGrab {
+    pub(crate) fn forward_release(&self) -> bool {
+        match self {
+            Self::Move { forward_release, .. } | Self::Resize { forward_release, .. } => {
+                *forward_release
+            }
+        }
+    }
 }
 
 /// Pending built-in screenshot (`Print` = whole screen, `Shift/Mod + Print` = focused window).
@@ -535,35 +637,40 @@ impl PurpState {
         for (idx, w) in self.windows.iter_mut().enumerate() {
             if !w.rules_applied {
                 let (app_id, title) = w.app_id_and_title();
-                if !app_id.is_empty() || !title.is_empty() {
-                    w.rules_applied = true;
-                    for rule in WINDOW_RULES {
-                        let app_matches = rule
-                            .app_id_match
-                            .is_some_and(|m| !app_id.is_empty() && app_id.contains(m));
-                        let title_matches = rule
-                            .title_match
-                            .is_some_and(|m| !title.is_empty() && title.contains(m));
-                        if app_matches || title_matches {
-                            if rule.tags != 0 {
-                                w.tags = rule.tags & TAGMASK;
-                            }
-                            if rule.is_floating {
-                                // Dialogs open at the size they ask for; until they draw,
-                                // reserve a centred default box.
-                                w.is_floating = true;
-                                w.size_from_client = true;
-                                let fw = 920.min(out_size.w - 48);
-                                let fh = 680.min(out_size.h - 64);
-                                w.float_geo.size = Size::from((fw, fh));
-                                newly_floated.push(idx);
-                            }
-                            if let Some(op) = rule.opacity {
-                                w.opacity_override = Some(op);
-                            }
-                            break;
-                        }
+                if app_id.is_empty() && title.is_empty() {
+                    continue;
+                }
+                w.rule_seen = (app_id.clone(), title.clone());
+                let mut matched = false;
+                for rule in WINDOW_RULES {
+                    if !rule.matches(&app_id, &title) {
+                        continue;
                     }
+                    matched = true;
+                    if rule.tags != 0 {
+                        w.tags = rule.tags & TAGMASK;
+                    }
+                    if rule.is_floating {
+                        // Dialogs open at the size they ask for; until they draw,
+                        // reserve a centred default box.
+                        w.is_floating = true;
+                        w.size_from_client = true;
+                        let fw = 920
+                            .min(out_size.w.saturating_sub(48))
+                            .clamp(1, out_size.w.max(1));
+                        let fh = 680
+                            .min(out_size.h.saturating_sub(64))
+                            .clamp(1, out_size.h.max(1));
+                        w.float_geo.size = Size::from((fw, fh));
+                        newly_floated.push(idx);
+                    }
+                    if let Some(op) = rule.opacity {
+                        w.opacity_override = Some(op);
+                    }
+                    break;
+                }
+                if window_rules_settled(matched, &app_id, &title) {
+                    w.rules_applied = true;
                 }
             }
         }
@@ -611,13 +718,7 @@ impl PurpState {
             return;
         }
 
-        let layer_target = self
-            .layer_surfaces
-            .iter()
-            .rev()
-            .find(|l| l.surface.alive() && l.is_mapped() && l.wants_keyboard_focus())
-            .map(|l| l.surface.wl_surface().clone())
-            .or_else(|| self.layer_focus.clone().filter(|s| s.alive()));
+        let layer_target = self.keyboard_layer_surface();
 
         let target_surface = layer_target.or_else(|| {
             self.focused_idx
@@ -712,7 +813,8 @@ impl PurpState {
 
     /// Visible windows from topmost to bottommost. Rendering and hit-testing both use this,
     /// so the window you see under the pointer is the one that gets the input:
-    /// focused fullscreen window, then floating windows, then tiled ones (focused first in each).
+    /// fullscreen windows (focused first), then floating windows, then tiled ones
+    /// (focused first in each group).
     pub fn stacking_order(&self) -> Vec<usize> {
         let tags = self.workspace.selected_tags;
         let focused = self
@@ -721,8 +823,14 @@ impl PurpState {
         let floats = |w: &ManagedWindow| (w.is_floating || w.is_scratchpad) && !w.is_fullscreen;
 
         let mut order = Vec::with_capacity(self.windows.len());
+        // Every fullscreen window covers ordinary windows, focused or not.
         if let Some(f) = focused.filter(|&i| self.windows[i].is_fullscreen) {
             order.push(f);
+        }
+        for (i, w) in self.windows.iter().enumerate() {
+            if Some(i) != focused && w.is_visible_on(tags) && w.is_fullscreen {
+                order.push(i);
+            }
         }
         for pass_floating in [true, false] {
             if let Some(f) = focused
@@ -731,12 +839,33 @@ impl PurpState {
                 order.push(f);
             }
             for (i, w) in self.windows.iter().enumerate() {
-                if Some(i) != focused && w.is_visible_on(tags) && floats(w) == pass_floating {
+                if Some(i) != focused
+                    && w.is_visible_on(tags)
+                    && !w.is_fullscreen
+                    && floats(w) == pass_floating
+                {
                     order.push(i);
                 }
             }
         }
         order
+    }
+
+    /// Exclusive layer, else the OnDemand layer the user clicked, if it is still mapped.
+    /// An unmapped launcher must not keep the keyboard after it hides.
+    fn keyboard_layer_surface(&self) -> Option<WlSurface> {
+        self.layer_surfaces
+            .iter()
+            .rev()
+            .find(|l| l.surface.alive() && l.is_mapped() && l.wants_keyboard_focus())
+            .map(|l| l.surface.wl_surface().clone())
+            .or_else(|| {
+                let focus = self.layer_focus.as_ref()?;
+                self.layer_surfaces
+                    .iter()
+                    .any(|l| l.surface.wl_surface() == focus && l.surface.alive() && l.is_mapped())
+                    .then(|| focus.clone())
+            })
     }
 
     /// Focus next (`delta = 1`) or previous (`delta = -1`) visible window on current tags.
@@ -751,16 +880,22 @@ impl PurpState {
 
         if visible.is_empty() {
             self.focused_idx = None;
+            self.sync_keyboard_focus();
+            self.sync_pointer_focus(0);
             return;
         }
 
-        let current_pos = self
+        let len = visible.len() as isize;
+        // No current focus (or focus on a hidden window) should land on the
+        // first or last visible window, not skip past it.
+        let next_pos = match self
             .focused_idx
             .and_then(|cur| visible.iter().position(|&i| i == cur))
-            .unwrap_or(0);
-
-        let len = visible.len() as isize;
-        let next_pos = (current_pos as isize + delta).rem_euclid(len) as usize;
+        {
+            Some(current_pos) => (current_pos as isize + delta).rem_euclid(len) as usize,
+            None if delta < 0 => visible.len() - 1,
+            None => 0,
+        };
         self.focused_idx = Some(visible[next_pos]);
         self.relayout();
     }
@@ -869,9 +1004,9 @@ impl PurpState {
             master
         };
 
-        if let Some(target) = target {
+        if let (Some(master), Some(target)) = (master, target) {
             self.windows.swap(target, focused);
-            self.focused_idx = Some(target);
+            self.focused_idx = Some(focus_after_zoom(master, focused, target));
             self.relayout();
         }
     }
@@ -967,10 +1102,16 @@ impl PurpState {
                     && (w.float_geo.loc.y - p.y).abs() < STEP / 2
             })
         };
+        let clamp = |p: Point<i32, Logical>| {
+            Point::<i32, Logical>::from((
+                p.x.clamp(0, (out.w - size.w).max(0)),
+                p.y.clamp(top, (out.h - size.h).max(top)),
+            ))
+        };
         let mut loc = start;
         for step in 1..=12 {
             if !taken(loc) {
-                return loc;
+                return clamp(loc);
             }
             loc = Point::from((start.x + step * STEP, start.y + step * STEP));
             if loc.x + size.w > out.w || loc.y + size.h > out.h {
@@ -978,7 +1119,7 @@ impl PurpState {
                 loc = Point::from((STEP * step, top + STEP * step));
             }
         }
-        loc
+        clamp(loc)
     }
 
     /// For self-sizing floating windows, make the frame match what the client actually drew
@@ -1068,12 +1209,8 @@ impl PurpState {
             let currently_hidden = self.windows[idx].is_hidden;
             self.windows[idx].is_hidden = !currently_hidden;
             if currently_hidden {
-                let sw = (self.output_size.w * 7 / 10).max(480);
-                let sh = (self.output_size.h * 7 / 10).max(320);
-                let sx = (self.output_size.w - sw) / 2;
-                let sy = (self.output_size.h - sh) / 2;
                 self.windows[idx].float_geo =
-                    Rectangle::new(Point::from((sx, sy)), Size::from((sw, sh)));
+                    scratchpad_geo(self.output_size, self.workspace.show_bar);
                 self.windows[idx].geo = self.windows[idx].float_geo;
                 self.focused_idx = Some(idx);
             } else if self.focused_idx == Some(idx) {
@@ -1147,10 +1284,7 @@ impl PurpState {
                 .output()
             {
                 let text = String::from_utf8_lossy(&out.stdout);
-                let wifi_disconnected = text
-                    .lines()
-                    .any(|l| l.starts_with("wifi:") && !l.contains(":connected"));
-                if wifi_disconnected {
+                if wifi_needs_autoconnect(&text) {
                     let _ = Command::new("nmcli")
                         .args(["device", "connect", "wlan0"])
                         .status();
@@ -1512,7 +1646,13 @@ impl PurpState {
     }
 
     /// Start a client-initiated interactive window move or resize (`xdg_toplevel.move` / `resize`).
-    fn begin_client_interactive_grab(&mut self, surface: &ToplevelSurface, is_move: bool) {
+    /// `edges` is `None` for a move. The button or touch that started the grab was
+    /// already delivered to the client, so its release is forwarded too.
+    fn begin_client_interactive_grab(
+        &mut self,
+        surface: &ToplevelSurface,
+        edges: Option<xdg_toplevel::ResizeEdge>,
+    ) {
         if self.is_locked() {
             return;
         }
@@ -1540,17 +1680,20 @@ impl PurpState {
         }
         let start_geo = w.float_geo;
         let wl_surface = w.wl_surface().clone();
-        self.active_grab = Some(if is_move {
-            InteractiveGrab::Move {
-                surface: wl_surface,
-                start_pointer,
-                start_geo,
-            }
-        } else {
+        self.active_grab = Some(if let Some(edge) = edges {
             InteractiveGrab::Resize {
                 surface: wl_surface,
                 start_pointer,
                 start_geo,
+                edges: resize_edges_from_request(edge),
+                forward_release: true,
+            }
+        } else {
+            InteractiveGrab::Move {
+                surface: wl_surface,
+                start_pointer,
+                start_geo,
+                forward_release: true,
             }
         });
         self.relayout();
@@ -1581,7 +1724,7 @@ impl PurpState {
         };
         let mut target = Rectangle::new(
             Point::from((0, top)),
-            Size::from((self.output_size.w, self.output_size.h - top)),
+            Size::from((self.output_size.w.max(1), (self.output_size.h - top).max(1))),
         );
         // The positioner works relative to the parent's window geometry.
         target.loc -= get_popup_toplevel_coords(&kind);
@@ -1672,7 +1815,9 @@ fn screenshot_timestamp() -> String {
     unsafe {
         let now = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&now, &mut tm);
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return "00000000-000000".to_string();
+        }
         format!(
             "{:04}{:02}{:02}-{:02}{:02}{:02}",
             tm.tm_year + 1900,
@@ -1755,10 +1900,13 @@ impl CompositorHandler for PurpState {
             }
         }
 
-        let needs_rule_check = self
-            .windows
-            .iter()
-            .any(|w| w.wl_surface() == surface && !w.rules_applied);
+        let needs_rule_check = self.windows.iter().any(|w| {
+            if w.rules_applied || w.wl_surface() != surface {
+                return false;
+            }
+            let (app_id, title) = w.app_id_and_title();
+            (!app_id.is_empty() || !title.is_empty()) && (app_id, title) != w.rule_seen
+        });
         if needs_rule_check {
             self.relayout();
         }
@@ -2011,11 +2159,7 @@ impl XdgShellHandler for PurpState {
             self.pending_scratchpad_spawn = false;
             win.is_scratchpad = true;
             win.is_floating = true;
-            let sw = (self.output_size.w * 7 / 10).max(480);
-            let sh = (self.output_size.h * 7 / 10).max(320);
-            let sx = (self.output_size.w - sw) / 2;
-            let sy = (self.output_size.h - sh) / 2;
-            win.float_geo = Rectangle::new(Point::from((sx, sy)), Size::from((sw, sh)));
+            win.float_geo = scratchpad_geo(self.output_size, self.workspace.show_bar);
             win.geo = win.float_geo;
         }
         self.windows.insert(0, win);
@@ -2107,7 +2251,7 @@ impl XdgShellHandler for PurpState {
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
-        self.begin_client_interactive_grab(&surface, true);
+        self.begin_client_interactive_grab(&surface, None);
     }
 
     fn resize_request(
@@ -2115,14 +2259,17 @@ impl XdgShellHandler for PurpState {
         surface: ToplevelSurface,
         _seat: wl_seat::WlSeat,
         _serial: Serial,
-        _edges: xdg_toplevel::ResizeEdge,
+        edges: xdg_toplevel::ResizeEdge,
     ) {
-        self.begin_client_interactive_grab(&surface, false);
+        self.begin_client_interactive_grab(&surface, Some(edges));
     }
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
-        if let Some(w) = self.windows.iter_mut().find(|w| w.toplevel == surface) {
-            w.is_fullscreen = true;
+        if let Some(idx) = self.windows.iter().position(|w| w.toplevel == surface) {
+            self.windows[idx].is_fullscreen = true;
+            if self.windows[idx].is_visible_on(self.workspace.selected_tags) {
+                self.focused_idx = Some(idx);
+            }
             self.relayout();
         }
     }
@@ -2135,17 +2282,38 @@ impl XdgShellHandler for PurpState {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        surface.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Maximized);
-        });
-        surface.send_pending_configure();
+        // Tiling has no maximize state. Reconfigure without the bit so the
+        // client is not left maximized at its tiled size.
+        let _ = surface;
+        self.relayout();
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        surface.with_pending_state(|state| {
-            state.states.unset(xdg_toplevel::State::Maximized);
-        });
-        surface.send_pending_configure();
+        let _ = surface;
+        self.relayout();
+    }
+}
+
+fn resize_edges_from_request(edge: xdg_toplevel::ResizeEdge) -> ResizeEdges {
+    use xdg_toplevel::ResizeEdge::{
+        Bottom, BottomLeft, BottomRight, Left, Right, Top, TopLeft, TopRight,
+    };
+    let (left, top, right, bottom) = match edge {
+        Left => (true, false, false, false),
+        Right => (false, false, true, false),
+        Top => (false, true, false, false),
+        Bottom => (false, false, false, true),
+        TopLeft => (true, true, false, false),
+        TopRight => (false, true, true, false),
+        BottomLeft => (true, false, false, true),
+        BottomRight => (false, false, true, true),
+        _ => (false, false, true, true),
+    };
+    ResizeEdges {
+        left,
+        top,
+        right,
+        bottom,
     }
 }
 

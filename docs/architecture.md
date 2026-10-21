@@ -74,7 +74,7 @@ toasts are rasterised directly at physical resolution so text stays sharp.
 `PurpState::windows` is ordered newest-first. `stacking_order()` is the single source of
 truth for "what is on top" and is used by both rendering and pointer/touch hit-testing:
 
-1. The focused window, if it is fullscreen
+1. Fullscreen windows (the focused one first)
 2. Floating and scratchpad windows (focused one first)
 3. Tiled windows (focused one first)
 

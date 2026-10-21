@@ -111,7 +111,7 @@ absolute path) is started. Children get the session's `WAYLAND_DISPLAY`,
 | `BRIGHTNESS_UP/DOWN_COMMANDS` | Brightness keys (logind fallback if none found) |
 | `MEDIA_*_COMMANDS` | Media keys |
 | `POLKIT_COMMANDS` | Started once at login |
-| `AUTOSTART_COMMANDS` | Started once at login if installed (e.g. `mako`, `dunst`) |
+| `AUTOSTART_COMMANDS` | Started once at login if installed (empty by default; the built-in notification daemon already owns the bus) |
 | `SCREENSHOT_DIR` | Screenshot folder, relative to `$HOME` |
 
 The launcher daemon itself is pre-started by `PurpState::spawn_spotlight_daemon` in
