@@ -1220,8 +1220,12 @@ impl PurpState {
         } else {
             // Only arm the flag if a terminal actually launched, otherwise the next
             // unrelated window would be swallowed as the scratchpad.
-            self.pending_scratchpad_spawn =
-                self.spawn_first_available(TERMINAL_COMMANDS, "scratchpad terminal");
+            self.pending_scratchpad_spawn = self.spawn_configured(
+                "PURPWM_TERMINAL",
+                &[],
+                TERMINAL_COMMANDS,
+                "scratchpad terminal",
+            );
         }
     }
 
@@ -1234,18 +1238,26 @@ impl PurpState {
         }
     }
 
-    /// Toggle `/home/mag/Documents/Spotlight` as the app launcher.
+    /// Toggle Spotlight as the app launcher.
     /// Fast path: write `"Toggle"\n` directly to the daemon's Unix domain socket (`$XDG_RUNTIME_DIR/spotlight.sock`),
     /// taking ~0.03ms with zero fork/exec overhead.
     /// Fallback: if the socket connection fails (daemon not running), spawn the binary via [`LAUNCHER_COMMANDS`].
     pub fn spawn_launcher(&self) {
+        if std::env::var("PURPWM_SPOTLIGHT").as_deref() == Ok("none") {
+            return;
+        }
         let sock_path = self.runtime_dir.join("spotlight.sock");
         if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock_path) {
             if stream.write_all(b"\"Toggle\"\n").is_ok() && stream.flush().is_ok() {
                 return;
             }
         }
-        self.spawn_first_available(LAUNCHER_COMMANDS, "Spotlight launcher");
+        self.spawn_configured(
+            "PURPWM_SPOTLIGHT",
+            &["--toggle"],
+            LAUNCHER_COMMANDS,
+            "Spotlight launcher",
+        );
     }
 
     /// Pre-warm the `Spotlight --daemon` instance attached to `purpwm`'s Wayland display.
@@ -1253,22 +1265,18 @@ impl PurpState {
     /// binds cleanly to `purpwm`'s `WAYLAND_DISPLAY` while preserving the real `XDG_RUNTIME_DIR`
     /// (`/run/user/<uid>`) for D-Bus, PipeWire, and NetworkManager!
     pub fn spawn_spotlight_daemon(&self) {
+        let program = std::env::var("PURPWM_SPOTLIGHT")
+            .ok()
+            .filter(|s| !s.is_empty() && s != "auto")
+            .unwrap_or_else(|| "spotlight".into());
+        if program == "none" || !command_exists(&program) {
+            return;
+        }
         let _ = Command::new("pkill").args(["-x", "spotlight"]).status();
         let sock_path = self.runtime_dir.join("spotlight.sock");
         let _ = std::fs::remove_file(&sock_path);
 
-        let daemon_candidates: &[&[&str]] = &[
-            &[
-                "/home/mag/Documents/Spotlight/target/release/spotlight",
-                "--daemon",
-            ],
-            &[
-                "/home/mag/Documents/Spotlight/target/debug/spotlight",
-                "--daemon",
-            ],
-            &["/home/mag/.local/bin/spotlight", "--daemon"],
-        ];
-        self.spawn_first_available(daemon_candidates, "Spotlight daemon");
+        self.spawn_detached_cmd(&[&program, "--daemon"], "Spotlight daemon");
     }
 
     /// Ensure Wi-Fi (`NetworkManager`) and Bluetooth (`bluetoothd`) are powered and connected on session start.
@@ -1368,7 +1376,29 @@ impl PurpState {
     }
 
     pub fn spawn_terminal(&self) {
-        self.spawn_first_available(TERMINAL_COMMANDS, "terminal");
+        self.spawn_configured("PURPWM_TERMINAL", &[], TERMINAL_COMMANDS, "terminal");
+    }
+
+    /// A configured executable is a single path/name, with no shell evaluation.
+    fn spawn_configured(
+        &self,
+        variable: &str,
+        args: &[&str],
+        candidates: &[&[&str]],
+        description: &str,
+    ) -> bool {
+        if let Ok(program) = std::env::var(variable) {
+            if program == "none" {
+                return false;
+            }
+            if !program.is_empty() && program != "auto" {
+                let command: Vec<&str> = std::iter::once(program.as_str())
+                    .chain(args.iter().copied())
+                    .collect();
+                return self.spawn_detached_cmd(&command, description);
+            }
+        }
+        self.spawn_first_available(candidates, description)
     }
 
     /// Run user autostart commands from [`AUTOSTART_COMMANDS`].
@@ -1746,15 +1776,19 @@ fn apply_preferred_scale(surface: &WlSurface, scale: f64) {
     });
 }
 
-/// Startup scale: `PURPWM_SCALE`, else the value saved by the scale keybindings, else the default.
+/// Explicit scale, saved keybinding scale, install default, then compile-time default.
 pub fn initial_scale() -> f64 {
-    std::env::var("PURPWM_SCALE")
-        .ok()
-        .or_else(|| std::fs::read_to_string(scale_file_path()?).ok())
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|s| s.is_finite())
-        .unwrap_or(DEFAULT_SCALE)
-        .clamp(SCALE_MIN, SCALE_MAX)
+    [
+        std::env::var("PURPWM_SCALE").ok(),
+        scale_file_path().and_then(|p| std::fs::read_to_string(p).ok()),
+        std::env::var("PURPWM_DEFAULT_SCALE").ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|s| s.trim().parse::<f64>().ok())
+    .find(|s| s.is_finite())
+    .unwrap_or(DEFAULT_SCALE)
+    .clamp(SCALE_MIN, SCALE_MAX)
 }
 
 fn scale_file_path() -> Option<PathBuf> {

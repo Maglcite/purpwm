@@ -1,6 +1,6 @@
 //! Keyboard, pointer, and touch input handling for `purpwm`, including:
 //! - `Mod + h` keybinding cheat sheet overlay (closed with `Mod + h`, `Escape`, or any click / tap)
-//! - Solo `Mod` tap detection (press and release `Mod` alone to launch `/home/mag/Documents/Spotlight`)
+//! - Solo `Mod` tap detection (press and release `Mod` alone to launch Spotlight)
 //! - `Mod + Arrow` keys to move windows around (and `Mod + Shift + Arrow` to resize)
 //! - Full `dwm` keybindings (`Mod + 1..9`, `Mod + j/k`, `Mod + [/]`, `Mod + Return`, etc.)
 //! - Built-in PAM lock screen (`Mod + Shift + l` / `Mod + Ctrl + l` / `XF86ScreenSaver`)

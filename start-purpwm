@@ -1,12 +1,42 @@
 #!/bin/sh
 set -e
 
-# If invoked from /usr/local/bin/start-purpwm after user login, delegate to the live repo script
-# so future rebuilds or script tweaks in /home/mag/Documents/purpwm take effect without sudo!
-if [ "$1" = "--delegated" ]; then
-    shift
-elif [ -x "/home/mag/Documents/purpwm/start-purpwm" ] && [ "$0" != "/home/mag/Documents/purpwm/start-purpwm" ]; then
-    exec /home/mag/Documents/purpwm/start-purpwm --delegated "$@"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# The installer replaces this marker with the selected configuration path.
+# INSTALLER_SESSION_CONFIG
+PURPWM_SESSION_CONFIG=${PURPWM_SESSION_CONFIG:-"$SCRIPT_DIR/../share/purpwm/session.conf"}
+if [ -r "$PURPWM_SESSION_CONFIG" ]; then
+    . "$PURPWM_SESSION_CONFIG"
+fi
+USER_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/purpwm/session.conf"
+if [ "$USER_CONFIG" != "$PURPWM_SESSION_CONFIG" ] && [ -r "$USER_CONFIG" ]; then
+    . "$USER_CONFIG"
+fi
+
+# Put installed helpers first, even when using a custom executable directory.
+export PATH="$SCRIPT_DIR:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:$PATH"
+if [ -z "$PURPWM_BIN" ]; then
+    if [ -x "$SCRIPT_DIR/purpwm" ] && [ ! -d "$SCRIPT_DIR/purpwm" ]; then
+        PURPWM_BIN="$SCRIPT_DIR/purpwm"
+    elif [ -x "$SCRIPT_DIR/target/release/purpwm" ]; then
+        PURPWM_BIN="$SCRIPT_DIR/target/release/purpwm"
+    else
+        PURPWM_BIN=$(command -v purpwm || true)
+    fi
+fi
+if [ ! -x "$PURPWM_BIN" ]; then
+    echo 'purpwm executable not found. Run ./install.sh, or set PURPWM_BIN to a release binary.' >&2
+    exit 1
+fi
+
+AUTOSTART=${PURPWM_AUTOSTART:-1}
+for arg in "$@"; do
+    if [ "$arg" = "--no-autostart" ]; then
+        AUTOSTART=0
+    fi
+done
+if [ "$AUTOSTART" = 0 ]; then
+    set -- --no-autostart "$@"
 fi
 
 # Ensure XDG_RUNTIME_DIR and systemd user D-Bus session bus are set properly
@@ -29,11 +59,8 @@ export _JAVA_AWT_WM_NONREPARENTING=1
 # with VK_ERROR_SURFACE_LOST_KHR after a ~500ms timeout stall. Setting WGPU_BACKEND=gl eliminates this.
 export WGPU_BACKEND=gl
 
-# Ensure user's ~/.local/bin and cargo bin are in PATH
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:$PATH"
-
 # Unlock / attach gnome-keyring-daemon for Wi-Fi & secret storage
-if command -v gnome-keyring-daemon >/dev/null 2>&1; then
+if [ "$AUTOSTART" != 0 ] && command -v gnome-keyring-daemon >/dev/null 2>&1; then
     eval "$(gnome-keyring-daemon --start --components=pkcs11,secrets,ssh 2>/dev/null || true)"
 fi
 if [ -S "$XDG_RUNTIME_DIR/gcr/ssh" ]; then
@@ -43,33 +70,23 @@ elif [ -S "$XDG_RUNTIME_DIR/keyring/ssh" ]; then
 fi
 
 # Import environment into systemd user session
-if command -v systemctl >/dev/null 2>&1; then
+if [ "$AUTOSTART" != 0 ] && command -v systemctl >/dev/null 2>&1; then
     systemctl --user import-environment XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DBUS_SESSION_BUS_ADDRESS SSH_AUTH_SOCK PATH WGPU_BACKEND 2>/dev/null || true
 fi
 
-# Ensure Wi-Fi and Bluetooth are active on session login
-(
+# Ensure Wi-Fi and Bluetooth are active on session login.
+if [ "$AUTOSTART" != 0 ]; then (
     nmcli networking on >/dev/null 2>&1 || true
     nmcli radio wifi on >/dev/null 2>&1 || true
     rfkill unblock bluetooth >/dev/null 2>&1 || true
     bluetoothctl power on >/dev/null 2>&1 || true
 ) &
-
-# Prefer the live release binary in /home/mag/Documents/purpwm/target/release/purpwm first
-if [ -x "/home/mag/Documents/purpwm/target/release/purpwm" ]; then
-    PURPWM_BIN="/home/mag/Documents/purpwm/target/release/purpwm"
-elif [ -x "$HOME/.local/bin/purpwm" ]; then
-    PURPWM_BIN="$HOME/.local/bin/purpwm"
-elif [ -x "/usr/local/bin/purpwm" ]; then
-    PURPWM_BIN="/usr/local/bin/purpwm"
-else
-    PURPWM_BIN="purpwm"
 fi
 
 # Detect native DRM panel resolution. An internal panel (eDP/LVDS/DSI) wins
 # over whichever connected connector happens to sort first.
-NATIVE_W=2560
-NATIVE_H=1600
+NATIVE_W=1920
+NATIVE_H=1080
 INTERNAL_W=""
 INTERNAL_H=""
 EXTERNAL_W=""
@@ -108,6 +125,28 @@ elif [ -n "$EXTERNAL_W" ]; then
     NATIVE_H="$EXTERNAL_H"
 fi
 
+if [ "${PURPWM_RESOLUTION:-auto}" != auto ]; then
+    W=${PURPWM_RESOLUTION%x*}
+    H=${PURPWM_RESOLUTION#*x}
+    case "$W:$H" in
+        *[!0-9:]*|:*|*:) echo 'PURPWM_RESOLUTION must be WIDTHxHEIGHT or auto.' >&2; exit 1 ;;
+    esac
+    if [ "$PURPWM_RESOLUTION" != "${W}x${H}" ] || [ "$W" -lt 100 ] || [ "$H" -lt 100 ]; then
+        echo 'PURPWM_RESOLUTION must be WIDTHxHEIGHT (at least 100x100) or auto.' >&2
+        exit 1
+    fi
+    NATIVE_W=$W
+    NATIVE_H=$H
+fi
+REFRESH_RATE=${PURPWM_REFRESH_RATE:-120}
+case "$REFRESH_RATE" in
+    *[!0-9]*|'') echo 'PURPWM_REFRESH_RATE must be an integer between 1 and 1000.' >&2; exit 1 ;;
+esac
+if [ "$REFRESH_RATE" -lt 1 ] || [ "$REFRESH_RATE" -gt 1000 ]; then
+    echo 'PURPWM_REFRESH_RATE must be an integer between 1 and 1000.' >&2
+    exit 1
+fi
+
 # Check if running nested (inside an existing Wayland or X11 compositor)
 # or standalone (launched from COSMIC greeter / greetd on VT)
 if [ -n "$WAYLAND_DISPLAY" ] || [ -n "$DISPLAY" ]; then
@@ -115,8 +154,9 @@ if [ -n "$WAYLAND_DISPLAY" ] || [ -n "$DISPLAY" ]; then
 else
     export PURPWM_STANDALONE=1
     if command -v gamescope >/dev/null 2>&1; then
-        exec gamescope -W "$NATIVE_W" -H "$NATIVE_H" -w "$NATIVE_W" -h "$NATIVE_H" -r 120 -f --expose-wayland -- "$PURPWM_BIN" --standalone "$@"
+        exec gamescope -W "$NATIVE_W" -H "$NATIVE_H" -w "$NATIVE_W" -h "$NATIVE_H" -r "$REFRESH_RATE" -f --expose-wayland -- "$PURPWM_BIN" --standalone "$@"
     else
-        exec "$PURPWM_BIN" --standalone "$@"
+        echo 'Standalone purpwm needs gamescope. Install gamescope, or try purpwm inside an existing Wayland/X11 session.' >&2
+        exit 1
     fi
 fi

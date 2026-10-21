@@ -95,8 +95,8 @@ fn print_usage() {
          \n\
          KEYBINDINGS (Mod = Super/Logo or Alt):\n\
          \x20 Mod + h            Show / hide keybinding cheat sheet overlay (Esc / click to close)\n\
-         \x20 Tap Mod alone      Toggle Spotlight App Launcher (/home/mag/Documents/Spotlight)\n\
-         \x20 Mod + p            Toggle Spotlight App Launcher (/home/mag/Documents/Spotlight)\n\
+         \x20 Tap Mod alone      Toggle Spotlight App Launcher\n\
+         \x20 Mod + p            Toggle Spotlight App Launcher\n\
          \x20 Mod + Return       Open Terminal (alacritty / foot / kitty / etc.)\n\
          \x20 Mod + w            Open Wi-Fi Manager (or Left-Click WIFI pill in top bar)\n\
          \x20 Mod + Shift + w    Toggle Wi-Fi Radio On/Off (or Right-Click WIFI pill in top bar)\n\

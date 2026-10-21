@@ -286,7 +286,12 @@ impl StatusBar {
     }
 
     fn load_system_font() -> Option<Font> {
-        for path in FONT_PATHS {
+        let configured = std::env::var("PURPWM_FONT").ok();
+        for path in configured
+            .as_deref()
+            .into_iter()
+            .chain(FONT_PATHS.iter().copied())
+        {
             if let Ok(bytes) = fs::read(path) {
                 if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
                     tracing::info!("Loaded status bar font: {}", path);

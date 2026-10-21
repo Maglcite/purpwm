@@ -17,16 +17,25 @@ A small, `dwm`-inspired dynamic tiling **Wayland compositor** written in Rust on
 ## Quick start
 
 ```bash
-cargo build --release
-
-# Try it nested inside your current Wayland/X11 session
-./target/release/purpwm --no-autostart
-
-# Install as a login session for your display manager (COSMIC greeter, GDM, SDDM, ...)
-sudo ./install-session.sh
+git clone https://github.com/Maglcite/purpwm.git
+cd purpwm
+./install.sh
 ```
 
-Then pick **purpwm** on the login screen. Quit with **`Mod + Shift + q`**.
+The installer asks for user/system installation, directories, dependencies, terminal,
+Spotlight path, scale, resolution, refresh rate, and autostart. It builds the release
+binary and generates the session entry with your paths. Run it as your normal user;
+it uses `sudo` for system files and requested packages. Requires Python 3.9+ and a
+current stable Rust toolchain (or install the distro toolchain through setup).
+
+Choose a system installation to make **purpwm** available on the login screen.
+Quit with **`Mod + Shift + q`**. To preview setup without changing anything:
+
+```bash
+./install.sh --system --dry-run
+```
+
+For flags, user installs, and manual builds, see [Installation](docs/installation.md).
 
 `Mod` is **Super** or **Alt**. Press **`Mod + h`** anytime to bring up the keybinding cheat sheet; tapping `Mod` alone opens the launcher; `Mod + Return` opens a terminal.
 
@@ -44,9 +53,9 @@ Then pick **purpwm** on the login screen. Quit with **`Mod + Shift + q`**.
 
 purpwm is a personal daily-driver project. It runs as a nested winit client, either
 inside another compositor or full-screen inside `gamescope` when launched from a
-display manager; it does not drive DRM/KMS directly. Several defaults (Spotlight
-paths, helper script locations) point at the author's home directory and are meant
-to be edited in `src/config.rs`.
+display manager; it does not drive DRM/KMS directly. Installed helpers are found on
+`PATH`; session preferences can be changed without rebuilding. Theme, layouts, and
+keybindings are configured in `src/config.rs`.
 
 ## License
 

@@ -48,7 +48,7 @@ can be registered per login session, so another desktop's agent can block it.
 
 **The launcher doesn't open**
 Tapping `Mod` runs the first available entry in `LAUNCHER_COMMANDS`. Make sure the
-path exists, or change it in `src/config.rs`.
+path exists, or set `PURPWM_SPOTLIGHT` to its executable in your `session.conf`.
 
 **Wi-Fi / Bluetooth pill says `N/A`**
 `nmcli` or `bluetoothctl` isn't installed, or NetworkManager / `bluetoothd` isn't running
@@ -65,4 +65,6 @@ runs. The PNG file in `~/Pictures/Screenshots` stays.
 
 **The session won't start from the login screen**
 Standalone mode needs `gamescope`. Run `start-purpwm` from a TTY to see its errors, and
-check the paths at the top of `start-purpwm` and in `install-session.sh`.
+check the generated paths and settings in `session.conf`. Preview the installation
+with `./install.sh --system --dry-run`. If using a user install and the session isn't
+listed, install with `--system`; many display managers only read system session directories.

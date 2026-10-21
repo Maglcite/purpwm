@@ -8,7 +8,7 @@
 //!    hidden while the focused window is fullscreen
 //! 6. Renders popup menus above windows and the bar
 //! 7. Renders `wlr-layer-shell` surfaces: `Background`/`Bottom` under the windows, `Top`/`Overlay`
-//!    (such as `/home/mag/Documents/Spotlight`) on top
+//!    (such as Spotlight) on top
 //! 8. Renders active desktop notification toasts (`NotificationCenter`) in the top-right corner
 //! 9. Renders the `Mod + h` keybinding cheat sheet overlay (`HelpOverlay`) when visible
 //! 10. Renders any active Wayland drag-and-drop icon (`state.dnd_icon`) and the cursor

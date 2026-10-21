@@ -9,8 +9,39 @@ cargo build --release
 
 Then log out and back in (or restart the nested instance).
 
-The only runtime settings are the UI scale (below) and the `PURPWM_STANDALONE` /
-`PURPWM_SCALE` environment variables.
+Session preferences can be changed at runtime; theme, layouts, window rules and
+keybindings use the compile-time configuration above.
+
+## Session settings
+
+`./install.sh` writes the selected defaults to `session.conf`. The launcher reads the
+installation's file, then `${XDG_CONFIG_HOME:-~/.config}/purpwm/session.conf` for per-user
+overrides. Generated defaults fill unset environment variables, so environment values
+can override them. A manually written per-user assignment takes precedence when sourced.
+`PURPWM_SESSION_CONFIG` selects a different installation settings file.
+
+| Variable | Meaning |
+| :--- | :--- |
+| `PURPWM_TERMINAL` | Terminal executable name or path, shared by the terminal binding and scratchpad |
+| `PURPWM_SPOTLIGHT` | Spotlight executable name/path; `none` disables daemon startup and toggling |
+| `PURPWM_FONT` | Font file for the bar, help and lock screen |
+| `PURPWM_DEFAULT_SCALE` | Install default used when no explicit or saved UI scale exists |
+| `PURPWM_REFRESH_RATE` | Standalone refresh rate in Hz, default `120` |
+| `PURPWM_RESOLUTION` | `auto` or a resolution such as `2560x1600` |
+| `PURPWM_AUTOSTART` | `0` disables session helper startup; default `1` |
+| `PURPWM_BIN` | Optional explicit path to the compositor executable |
+
+For example, put these assignments in your per-user `session.conf`:
+
+```sh
+export PURPWM_TERMINAL='/usr/bin/foot'
+export PURPWM_SPOTLIGHT='/home/your-user/apps/spotlight'
+export PURPWM_REFRESH_RATE=144
+```
+
+Executable settings take a single name or path, with no arguments or shell expansion.
+Empty values use the compiled command candidates. Settings are read by `start-purpwm`;
+when running the binary directly, supply environment variables yourself.
 
 ## Scale (HiDPI)
 
@@ -24,7 +55,8 @@ The scale actually used at startup is, in order:
 
 1. `PURPWM_SCALE` environment variable (e.g. `PURPWM_SCALE=1.75`)
 2. `~/.config/purpwm/scale` (written whenever you change the scale with the keybindings)
-3. `DEFAULT_SCALE`
+3. `PURPWM_DEFAULT_SCALE` from the installer/session configuration
+4. `DEFAULT_SCALE`
 
 Apps that support `wp_fractional_scale_v1` (GTK 4, Qt 6, Firefox, Chromium/Electron, winit
 apps such as Alacritty) render at exactly this scale. Others are asked for the next integer
@@ -114,8 +146,9 @@ absolute path) is started. Children get the session's `WAYLAND_DISPLAY`,
 | `AUTOSTART_COMMANDS` | Started once at login if installed (empty by default; the built-in notification daemon already owns the bus) |
 | `SCREENSHOT_DIR` | Screenshot folder, relative to `$HOME` |
 
-The launcher daemon itself is pre-started by `PurpState::spawn_spotlight_daemon` in
-[`src/state.rs`](../src/state.rs); change the paths there if your launcher lives elsewhere.
+The launcher daemon is pre-started by `PurpState::spawn_spotlight_daemon` in
+[`src/state.rs`](../src/state.rs). It uses `PURPWM_SPOTLIGHT` or `spotlight` on `PATH`,
+as does the toggle binding. Terminal and helper defaults also use `PATH`.
 
 ## Helper scripts
 

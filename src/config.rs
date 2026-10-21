@@ -111,6 +111,8 @@ pub const FONT_PATHS: &[&str] = &[
     "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
     "/usr/share/fonts/gnu-free/FreeMono.ttf",
     "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
 ];
 
 // ============================================================================
@@ -312,19 +314,8 @@ pub const WINDOW_RULES: &[WindowRule] = &[
 // ============================================================================
 
 /// App launcher commands tried in order when `Mod` is tapped alone (or `Mod + p`).
-/// Configured to launch the user's `Spotlight` project (`/home/mag/Documents/Spotlight`).
-pub const LAUNCHER_COMMANDS: &[&[&str]] = &[
-    &[
-        "/home/mag/Documents/Spotlight/target/release/spotlight",
-        "--toggle",
-    ],
-    &[
-        "/home/mag/Documents/Spotlight/target/debug/spotlight",
-        "--toggle",
-    ],
-    &["/home/mag/.local/bin/spotlight", "--toggle"],
-    &["spotlight", "--toggle"],
-];
+/// Override the executable with `PURPWM_SPOTLIGHT`, or set it to `none` to disable.
+pub const LAUNCHER_COMMANDS: &[&[&str]] = &[&["spotlight", "--toggle"]];
 
 /// Terminal commands tried in order when `Mod + Return` is pressed.
 pub const TERMINAL_COMMANDS: &[&[&str]] = &[
@@ -362,9 +353,7 @@ pub const SYSTEM_MONITOR_COMMANDS: &[&[&str]] = &[
 
 /// Wi-Fi manager commands tried in order when clicking the `WIFI:` status bar pill or pressing `Mod + w`.
 pub const WIFI_COMMANDS: &[&[&str]] = &[
-    &["/usr/local/bin/purpwm-wifi"],
-    &["/home/mag/.local/bin/purpwm-wifi"],
-    &["/home/mag/Documents/purpwm/purpwm-wifi"],
+    &["purpwm-wifi"],
     &[
         "alacritty",
         "--class",
@@ -379,12 +368,7 @@ pub const WIFI_COMMANDS: &[&[&str]] = &[
 ];
 
 /// Bluetooth manager commands tried in order when clicking the `BT:` status bar pill or pressing `Mod + Shift + b`.
-pub const BLUETOOTH_COMMANDS: &[&[&str]] = &[
-    &["/usr/local/bin/purpwm-bt"],
-    &["/home/mag/.local/bin/purpwm-bt"],
-    &["/home/mag/Documents/purpwm/purpwm-bt"],
-    &["cosmic-settings", "bluetooth"],
-];
+pub const BLUETOOTH_COMMANDS: &[&[&str]] = &[&["purpwm-bt"], &["cosmic-settings", "bluetooth"]];
 
 /// Audio volume up commands (`XF86AudioRaiseVolume`).
 pub const VOL_UP_COMMANDS: &[&[&str]] = &[
@@ -440,11 +424,7 @@ pub const SCREENSHOT_DIR: &str = "Pictures/Screenshots";
 pub const MIXER_COMMANDS: &[&[&str]] = &[&["pavucontrol"], &["cosmic-settings", "sound"]];
 
 /// Polkit authentication agent commands tried in order.
-pub const POLKIT_COMMANDS: &[&[&str]] = &[
-    &["/usr/local/bin/purpwm-polkit-agent"],
-    &["/home/mag/.local/bin/purpwm-polkit-agent"],
-    &["/home/mag/Documents/purpwm/purpwm-polkit-agent"],
-];
+pub const POLKIT_COMMANDS: &[&[&str]] = &[&["purpwm-polkit-agent"]];
 
 /// Optional background commands started once at login.
 ///
