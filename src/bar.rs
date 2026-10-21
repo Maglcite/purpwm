@@ -196,7 +196,10 @@ impl StatusBar {
         self.font_px = BAR_FONT_SIZE * scale as f32;
         self.height = (BAR_HEIGHT as f64 * scale).round() as i32;
         self.tag_cell_width = (34.0 * scale).round() as i32;
-        self.layout_cell_end = self.tag_cell_width * TAG_NAMES.len() as i32;
+        // Keep a non-empty layout-symbol target until the next raster measures it.
+        // Setting this equal to the tag strip made the symbol unclickable.
+        self.layout_cell_end =
+            self.tag_cell_width * TAG_NAMES.len() as i32 + (52.0 * scale).round() as i32;
         self.glyph_cache.clear();
         self.cache_ascii_glyphs();
         self.dirty = true;
@@ -382,23 +385,7 @@ impl StatusBar {
             "nmcli",
             &["-t", "-f", "TYPE,STATE,CONNECTION", "device", "status"],
         ) {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let mut parts = line.splitn(3, ':');
-                let dev_type = parts.next().unwrap_or("");
-                let state = parts.next().unwrap_or("");
-                let conn = parts.next().unwrap_or("").trim();
-                if dev_type == "wifi" {
-                    if state == "connected" && !conn.is_empty() {
-                        let short_ssid: String = conn.chars().take(14).collect();
-                        return (format!("WIFI: {}", short_ssid), true);
-                    } else if state.starts_with("connecting") {
-                        return ("WIFI: ...".to_string(), false);
-                    } else {
-                        return ("WIFI: Disconn".to_string(), false);
-                    }
-                }
-            }
+            return wifi_label_from_nmcli(&String::from_utf8_lossy(&out.stdout));
         }
         ("WIFI: N/A".to_string(), false)
     }
@@ -473,20 +460,7 @@ impl StatusBar {
             })
             .unwrap_or_else(|| "N/A".to_string());
 
-        // 3. Laptop Battery percentage from /sys/class/power_supply/BAT*
-        let bat_opt = ["BAT0", "BAT1"].iter().find_map(|bat| {
-            let cap_path = format!("/sys/class/power_supply/{}/capacity", bat);
-            let status_path = format!("/sys/class/power_supply/{}/status", bat);
-            if let Ok(cap_s) = fs::read_to_string(cap_path) {
-                let status_s = fs::read_to_string(status_path).unwrap_or_default();
-                let is_charging = status_s.trim().eq_ignore_ascii_case("charging");
-                let sym = if is_charging { "+" } else { "" };
-                Some(format!("BAT {}{}%  |  ", sym, cap_s.trim()))
-            } else {
-                None
-            }
-        });
-        let bat_prefix = bat_opt.unwrap_or_default();
+        let bat_prefix = battery_prefix();
 
         // 4. Local wall-clock time via libc::localtime_r
         let clock = Self::format_local_time();
@@ -501,7 +475,9 @@ impl StatusBar {
         unsafe {
             let now = libc::time(std::ptr::null_mut());
             let mut tm: libc::tm = std::mem::zeroed();
-            libc::localtime_r(&now, &mut tm);
+            if libc::localtime_r(&now, &mut tm).is_null() {
+                return "Jan 01 00:00".to_string();
+            }
             let months = [
                 "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
             ];
@@ -913,6 +889,56 @@ impl StatusBar {
             });
         }
     }
+}
+
+/// Prefer a connected wifi device over an earlier disconnected adapter.
+/// `text` is `nmcli -t -f TYPE,STATE,CONNECTION device status`.
+pub(crate) fn wifi_label_from_nmcli(text: &str) -> (String, bool) {
+    let mut fallback: Option<(String, bool)> = None;
+    for line in text.lines() {
+        let mut parts = line.splitn(3, ':');
+        let dev_type = parts.next().unwrap_or("");
+        let state = parts.next().unwrap_or("").trim();
+        let conn = parts.next().unwrap_or("").trim();
+        if dev_type != "wifi" {
+            continue;
+        }
+        if state == "connected" && !conn.is_empty() {
+            let short_ssid: String = conn.chars().take(14).collect();
+            return (format!("WIFI: {short_ssid}"), true);
+        } else if state.starts_with("connecting") {
+            fallback = Some(("WIFI: ...".to_string(), false));
+        } else if fallback.is_none() {
+            fallback = Some(("WIFI: Disconn".to_string(), false));
+        }
+    }
+    fallback.unwrap_or_else(|| ("WIFI: N/A".to_string(), false))
+}
+
+/// First battery under `/sys/class/power_supply`, not only `BAT0`/`BAT1`.
+fn battery_prefix() -> String {
+    let Ok(entries) = fs::read_dir("/sys/class/power_supply") else {
+        return String::new();
+    };
+    let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        let kind = fs::read_to_string(path.join("type")).unwrap_or_default();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let looks_like_battery =
+            kind.trim().eq_ignore_ascii_case("Battery") || name.to_ascii_lowercase().starts_with("bat");
+        if !looks_like_battery {
+            continue;
+        }
+        let Ok(cap_s) = fs::read_to_string(path.join("capacity")) else {
+            continue;
+        };
+        let status_s = fs::read_to_string(path.join("status")).unwrap_or_default();
+        let is_charging = status_s.trim().eq_ignore_ascii_case("charging");
+        let sym = if is_charging { "+" } else { "" };
+        return format!("BAT {}{}%  |  ", sym, cap_s.trim());
+    }
+    String::new()
 }
 
 /// Whether any rfkill switch of `kind` (`wlan`, `bluetooth`) is soft-blocked.

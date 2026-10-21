@@ -232,11 +232,26 @@ AGENT_INTROSPECTION = """
 """
 
 
+def unpack_detail(value):
+    # a{sv} values arrive as GLib.Variant, which int() will not accept.
+    if hasattr(value, "unpack"):
+        try:
+            return value.unpack()
+        except Exception:
+            return value
+    return value
+
+
 def identity_from_variant(kind, details):
-    if kind == "unix-user" and "uid" in details:
-        return Polkit.UnixUser.new(details["uid"])
-    if kind == "unix-group" and "gid" in details:
-        return Polkit.UnixGroup.new(details["gid"])
+    if not isinstance(details, dict):
+        return None
+    try:
+        if kind == "unix-user" and "uid" in details:
+            return Polkit.UnixUser.new(int(unpack_detail(details["uid"])))
+        if kind == "unix-group" and "gid" in details:
+            return Polkit.UnixGroup.new(int(unpack_detail(details["gid"])))
+    except Exception:
+        return None
     return None
 
 

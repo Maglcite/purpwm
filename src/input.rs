@@ -22,7 +22,7 @@ use smithay::{
         pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
         touch::{DownEvent as TouchDown, MotionEvent as TouchMotion, UpEvent as TouchUp},
     },
-    utils::{Logical, Point, Size, SERIAL_COUNTER},
+    utils::{Logical, Point, SERIAL_COUNTER},
     wayland::{
         compositor::with_states,
         shell::wlr_layer::{KeyboardInteractivity, LayerSurfaceCachedState},
@@ -418,8 +418,12 @@ impl PurpState {
             },
         );
 
-        if state == KeyState::Pressed && intercepted.is_some() {
-            self.intercepted_keys.push(keycode);
+        // While locked every key is swallowed above, so there is nothing to
+        // remember; recording repeats would leave stale keycodes after unlock.
+        if state == KeyState::Pressed && intercepted.is_some() && !self.is_locked() {
+            if !self.intercepted_keys.contains(&keycode) {
+                self.intercepted_keys.push(keycode);
+            }
         }
         if let Some(Some(act)) = intercepted {
             self.execute_key_action(act);
@@ -514,17 +518,20 @@ impl PurpState {
         let Some(grab) = self.active_grab.clone() else {
             return false;
         };
-        let (surface, start_pointer, start_geo, is_move) = match grab {
+        let (surface, start_pointer, start_geo, edges) = match grab {
             InteractiveGrab::Move {
                 surface,
                 start_pointer,
                 start_geo,
-            } => (surface, start_pointer, start_geo, true),
+                ..
+            } => (surface, start_pointer, start_geo, None),
             InteractiveGrab::Resize {
                 surface,
                 start_pointer,
                 start_geo,
-            } => (surface, start_pointer, start_geo, false),
+                edges,
+                ..
+            } => (surface, start_pointer, start_geo, Some(edges)),
         };
         let Some(w) = self.windows.iter_mut().find(|w| w.wl_surface() == &surface) else {
             self.active_grab = None;
@@ -533,17 +540,22 @@ impl PurpState {
         };
         let dx = (position.x - start_pointer.x).round() as i32;
         let dy = (position.y - start_pointer.y).round() as i32;
-        if is_move {
-            w.float_geo.loc.x = start_geo.loc.x + dx;
-            w.float_geo.loc.y = start_geo.loc.y + dy;
-        } else {
+        if let Some(edges) = edges {
             // The user picked a size now; keep it within the app's min/max size hints.
             w.size_from_client = false;
-            let wanted = Size::from((
-                (start_geo.size.w + dx).max(120),
-                (start_geo.size.h + dy).max(80),
-            ));
-            w.float_geo.size = w.clamp_frame_to_client_limits(wanted);
+            let wanted = crate::state::resize_rect(start_geo, dx, dy, edges, 120, 80);
+            let clamped = w.clamp_frame_to_client_limits(wanted.size);
+            w.float_geo.loc = wanted.loc;
+            if edges.left {
+                w.float_geo.loc.x = start_geo.loc.x + start_geo.size.w - clamped.w;
+            }
+            if edges.top {
+                w.float_geo.loc.y = start_geo.loc.y + start_geo.size.h - clamped.h;
+            }
+            w.float_geo.size = clamped;
+        } else {
+            w.float_geo.loc.x = start_geo.loc.x + dx;
+            w.float_geo.loc.y = start_geo.loc.y + dy;
         }
         w.geo = w.float_geo;
         self.relayout();
@@ -767,12 +779,17 @@ impl PurpState {
             return;
         }
 
-        if state == ButtonState::Released
-            && self.touch_grab_slot.is_none()
-            && self.active_grab.take().is_some()
-        {
-            self.relayout();
-            return;
+        if state == ButtonState::Released && self.touch_grab_slot.is_none() {
+            if let Some(grab) = self.active_grab.take() {
+                let forward = grab.forward_release();
+                self.relayout();
+                // Client-initiated move/resize already delivered the button
+                // press; dropping the release leaves the client stuck down.
+                if forward {
+                    self.forward_pointer_button(button, state, time);
+                }
+                return;
+            }
         }
 
         let pos = self.pointer_location;
@@ -844,6 +861,7 @@ impl PurpState {
                         surface,
                         start_pointer: pos,
                         start_geo,
+                        forward_release: false,
                     });
                     self.relayout();
                     return;
@@ -853,6 +871,8 @@ impl PurpState {
                         surface,
                         start_pointer: pos,
                         start_geo,
+                        edges: crate::state::ResizeEdges::BOTTOM_RIGHT,
+                        forward_release: false,
                     });
                     self.relayout();
                     return;
@@ -1003,6 +1023,7 @@ impl PurpState {
                     surface,
                     start_pointer: pos,
                     start_geo,
+                    forward_release: false,
                 });
                 self.relayout();
                 return;
@@ -1068,9 +1089,12 @@ impl PurpState {
 
         if self.touch_grab_slot == Some(slot) {
             self.touch_grab_slot = None;
-            if self.active_grab.take().is_some() {
+            if let Some(grab) = self.active_grab.take() {
+                let forward = grab.forward_release();
                 self.relayout();
-                return;
+                if !forward {
+                    return;
+                }
             }
         }
 

@@ -9,15 +9,23 @@ mod tests {
     };
 
     use crate::{
-        bar::{BarClickAction, StatusBar},
-        config::{BAR_HEIGHT, GAP_INNER, GAP_OUTER},
+        bar::{wifi_label_from_nmcli, BarClickAction, StatusBar},
+        config::{window_rules_settled, BAR_HEIGHT, GAP_INNER, GAP_OUTER, WindowRule},
         help::{rasterize, HelpOverlay},
         input::{keysym_to_lock_key, KeyAction},
         lock::{pam_check, LockKey, LockPoll, LockScreen, CONVERSATIONS},
-        notify::{parse_dbus_notification_line, NotificationCenter},
-        state::{touch_physical_to_logical_coords, PurpState},
-        wm::{LayoutMode, Workspace},
+        notify::{parse_dbus_line, parse_dbus_notification_line, DbusLine, NotificationCenter},
+        state::{
+            focus_after_zoom, resize_rect, touch_physical_to_logical_coords, wifi_needs_autoconnect,
+            PurpState, ResizeEdges,
+        },
+        wm::{
+            centered_side_widths, master_stack_widths, scratchpad_geo, split_lengths, LayoutMode,
+            Workspace,
+        },
     };
+
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_layout_mode_cycle() {
@@ -49,6 +57,12 @@ mod tests {
         assert_eq!(bar.hit_test(34 * 9 + 10), BarClickAction::CycleLayout);
         // Clicking in the middle title area cycles focus
         assert_eq!(bar.hit_test(800), BarClickAction::FocusNext);
+
+        // Changing scale must not collapse the layout-symbol hit target to zero width
+        // before the next raster (startup calls set_scale before the first frame).
+        let mut scaled = StatusBar::new(1600);
+        scaled.set_scale(1.5);
+        assert_eq!(scaled.hit_test(34 * 9 + 4), BarClickAction::CycleLayout);
     }
 
     #[test]
@@ -185,6 +199,34 @@ mod tests {
         assert_eq!(parsed.app_name, "notify-send");
         assert_eq!(parsed.summary, "Alert");
         assert_eq!(parsed.body, "Body text");
+
+        // Freedesktop: expire_timeout 0 means the toast never expires; a positive
+        // timeout is honoured instead of being clamped to 30s.
+        let persistent = parse_dbus_notification_line("9\t1\t0\tapp\tStay\tbody").unwrap();
+        assert!(
+            persistent.expires_at.is_none(),
+            "timeout 0 expired after {:?}",
+            persistent.expires_at
+        );
+        let minute = parse_dbus_notification_line("8\t1\t60000\tapp\tHold\tbody").unwrap();
+        let left = minute
+            .expires_at
+            .expect("positive timeout")
+            .saturating_duration_since(Instant::now());
+        assert!(
+            left > Duration::from_secs(50) && left < Duration::from_secs(70),
+            "60s timeout became {left:?}"
+        );
+
+        // A click on the inner edge of the remaining card must count (rounding
+        // x.8 up to the exclusive bound used to miss it).
+        let geo = nc.stack_geometry(1600, true).expect("remaining toast");
+        let edge = Point::<f64, Logical>::from((
+            geo.loc.x as f64 + geo.size.w as f64 - 0.2,
+            geo.loc.y as f64 + geo.size.h as f64 - 0.2,
+        ));
+        assert!(nc.dismiss_at(edge, 1600, true));
+        assert!(nc.is_empty());
     }
 
     #[test]
@@ -251,5 +293,124 @@ mod tests {
         assert!(state.help.visible);
         state.process_pointer_button(0x110, smithay::backend::input::ButtonState::Pressed, 10);
         assert!(!state.help.visible);
+    }
+
+    #[test]
+    fn test_cascade_keeps_oversized_windows_on_screen() {
+        let display: Display<PurpState> = Display::new().expect("create wayland display");
+        let state = PurpState::new(
+            display.handle(),
+            String::from("wayland-test-1"),
+            Size::from((200, 180)),
+            true,
+        );
+        let size = Size::from((480, 320));
+        let loc = state.cascade_loc(size, None);
+        assert!(loc.x >= 0, "x {}", loc.x);
+        assert!(loc.y >= 0, "y {}", loc.y);
+        assert!(loc.x + size.w > 200 || loc.x == 0);
+        assert_eq!(loc.x, 0);
+        assert_eq!(loc.y, BAR_HEIGHT);
+    }
+
+    #[test]
+    fn test_layout_splits_fit_the_usable_rect() {
+        let columns = split_lengths(100, 3, 6);
+        assert_eq!(columns.span(), 100);
+        let tight = split_lengths(20, 5, 8);
+        assert_eq!(tight.span(), 20);
+        assert!(tight.lengths.iter().all(|len| *len >= 0));
+
+        let (master, stack, gap) = master_stack_widths(100, 8, 0.9);
+        assert_eq!(master + gap + stack, 100);
+        let (left, master, right, gap) = centered_side_widths(100, 8, 0.9);
+        assert_eq!(left + gap + master + gap + right, 100);
+
+        let pad = scratchpad_geo(Size::from((200, 180)), true);
+        assert!(pad.loc.x >= 0 && pad.loc.y >= BAR_HEIGHT);
+        assert!(pad.loc.x + pad.size.w <= 200);
+        assert!(pad.loc.y + pad.size.h <= 180);
+    }
+
+    #[test]
+    fn test_window_rules_are_conjunctive() {
+        let rule = WindowRule {
+            app_id_match: Some("firefox"),
+            title_match: Some("Open File"),
+            tags: 0,
+            is_floating: true,
+            opacity: None,
+        };
+        assert!(rule.matches("firefox", "Open File"));
+        assert!(!rule.matches("firefox", "Browser"));
+        assert!(!rule.matches("chrome", "Open File"));
+        assert!(!window_rules_settled(false, "firefox", ""));
+        assert!(window_rules_settled(false, "firefox", "Browser"));
+        assert!(window_rules_settled(true, "firefox", ""));
+    }
+
+    #[test]
+    fn test_wifi_status_prefers_a_live_device() {
+        assert!(!wifi_needs_autoconnect(
+            "wifi:connected\nwifi:disconnected"
+        ));
+        assert!(wifi_needs_autoconnect("wifi:disconnected"));
+        assert!(!wifi_needs_autoconnect("ethernet:disconnected"));
+        assert!(!wifi_needs_autoconnect("wifi:connecting"));
+
+        let (label, up) = wifi_label_from_nmcli(
+            "wifi:disconnected:\nwifi:connected:Home Network\n",
+        );
+        assert!(up);
+        assert_eq!(label, "WIFI: Home Network");
+    }
+
+    #[test]
+    fn test_preferred_mode_prefers_the_internal_panel() {
+        use crate::pick_preferred_mode;
+        assert_eq!(
+            pick_preferred_mode(&[("card0-HDMI-A-1", "1920x1080"), ("card0-eDP-1", "2560x1600")]),
+            Some((2560, 1600))
+        );
+        assert_eq!(
+            pick_preferred_mode(&[("card0-HDMI-A-1", "1920x1080")]),
+            Some((1920, 1080))
+        );
+    }
+
+    #[test]
+    fn test_resize_and_zoom_keep_the_anchored_edge() {
+        let start = Rectangle::new(Point::from((100, 100)), Size::from((200, 200)));
+        let resized = resize_rect(
+            start,
+            40,
+            0,
+            ResizeEdges {
+                left: true,
+                top: false,
+                right: false,
+                bottom: false,
+            },
+            80,
+            60,
+        );
+        assert_eq!(resized.loc.x, 140);
+        assert_eq!(resized.size.w, 160);
+        assert_eq!(resized.loc.x + resized.size.w, 300);
+        assert_eq!(focus_after_zoom(0, 0, 2), 0);
+        assert_eq!(focus_after_zoom(0, 2, 0), 0);
+    }
+
+    #[test]
+    fn test_close_notification_removes_the_toast() {
+        let mut nc = NotificationCenter::new();
+        let id = nc.push(0, "app", "Hi", "Body", 1, Some(10_000));
+        assert!(matches!(
+            parse_dbus_line(&format!("close\t{id}")),
+            Some(DbusLine::Close(closed)) if closed == id
+        ));
+        nc.ingest_line(DbusLine::Close(id));
+        assert!(nc.tick());
+        assert!(nc.is_empty());
     }
 }

@@ -414,14 +414,36 @@ extern "C" fn pam_conversation(
         return PAM_BUF_ERR;
     }
     for i in 0..num_msg as usize {
-        let message = unsafe { &**msg.add(i) };
+        let message_ptr = unsafe { *msg.add(i) };
+        if message_ptr.is_null() {
+            free_pam_replies(replies, i);
+            return PAM_BUF_ERR;
+        }
+        let message = unsafe { &*message_ptr };
         if matches!(message.msg_style, PAM_PROMPT_ECHO_OFF | PAM_PROMPT_ECHO_ON) {
-            unsafe { (*replies.add(i)).resp = libc::strdup(password.as_ptr()) };
+            let dup = unsafe { libc::strdup(password.as_ptr()) };
+            if dup.is_null() {
+                free_pam_replies(replies, i);
+                return PAM_BUF_ERR;
+            }
+            unsafe { (*replies.add(i)).resp = dup };
         }
         CONVERSATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     unsafe { *resp = replies };
     PAM_SUCCESS
+}
+
+fn free_pam_replies(replies: *mut PamResponse, count: usize) {
+    unsafe {
+        for j in 0..count {
+            let resp = (*replies.add(j)).resp;
+            if !resp.is_null() {
+                libc::free(resp.cast());
+            }
+        }
+        libc::free(replies.cast());
+    }
 }
 
 /// Number of PAM prompts answered (lets tests check the conversation is wired up).

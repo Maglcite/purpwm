@@ -44,7 +44,7 @@ while true; do
         for line in "${DEVICES[@]}"; do
             mac=$(echo "$line" | awk '{print $2}')
             name=$(echo "$line" | cut -d' ' -f3-)
-            if echo "$CONNECTED_LIST" | grep -q "$mac"; then
+                if echo "$CONNECTED_LIST" | grep -qF "$mac"; then
                 echo -e "    ${PURPLE}[$idx]${RESET} ${BOLD}$name${RESET} ${DIM}($mac)${RESET} ${GREEN}[CONNECTED]${RESET}"
             else
                 echo -e "    ${PURPLE}[$idx]${RESET} $name ${DIM}($mac)${RESET}"
@@ -55,7 +55,7 @@ while true; do
 
     echo ""
     echo -e "${PURPLE}------------------------------------------------------------${RESET}"
-    echo -e "  ${BOLD}[1-9]${RESET} Connect / Disconnect device #"
+    echo -e "  ${BOLD}[number]${RESET} Connect / Disconnect device #"
     echo -e "  ${BOLD}[s]${RESET}   Scan for nearby Bluetooth devices (6s)"
     echo -e "  ${BOLD}[p]${RESET}   Pair & Trust a device by #"
     echo -e "  ${BOLD}[t]${RESET}   Toggle Bluetooth Power (ON/OFF)"
@@ -63,27 +63,25 @@ while true; do
     echo -e "  ${BOLD}[q]${RESET}   Quit"
     echo -e "${PURPLE}------------------------------------------------------------${RESET}"
     printf "  Select action: "
-    read -r -n 1 choice
-    echo ""
+    read -r choice
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#DEVICES[@]} ]; then
+        line="${DEVICES[$((choice - 1))]}"
+        mac=$(echo "$line" | awk '{print $2}')
+        name=$(echo "$line" | cut -d' ' -f3-)
+        if echo "$CONNECTED_LIST" | grep -qF "$mac"; then
+            echo -e "  Disconnecting ${BOLD}$name${RESET}..."
+            bluetoothctl disconnect "$mac"
+        else
+            echo -e "  Connecting to ${BOLD}$name${RESET}..."
+            bluetoothctl power on >/dev/null 2>&1 || true
+            bluetoothctl connect "$mac"
+        fi
+        sleep 1
+        continue
+    fi
 
     case "$choice" in
-        [1-9])
-            arr_idx=$((choice - 1))
-            if [ $arr_idx -lt ${#DEVICES[@]} ]; then
-                line="${DEVICES[$arr_idx]}"
-                mac=$(echo "$line" | awk '{print $2}')
-                name=$(echo "$line" | cut -d' ' -f3-)
-                if echo "$CONNECTED_LIST" | grep -q "$mac"; then
-                    echo -e "  Disconnecting ${BOLD}$name${RESET}..."
-                    bluetoothctl disconnect "$mac"
-                else
-                    echo -e "  Connecting to ${BOLD}$name${RESET}..."
-                    bluetoothctl power on >/dev/null 2>&1 || true
-                    bluetoothctl connect "$mac"
-                fi
-                sleep 1
-            fi
-            ;;
         s|S)
             bluetoothctl power on >/dev/null 2>&1 || true
             echo -e "  ${PURPLE}Scanning for nearby Bluetooth devices for 6 seconds...${RESET}"

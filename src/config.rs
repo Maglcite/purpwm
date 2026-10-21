@@ -132,6 +132,33 @@ pub struct WindowRule {
     pub opacity: Option<f32>,
 }
 
+impl WindowRule {
+    /// `None` on either field is a wildcard. A rule matches only when every
+    /// field that is set matches, so an `app_id` rule does not also fire on an
+    /// unrelated title and a title rule is not skipped because the app id differs.
+    pub(crate) fn matches(self, app_id: &str, title: &str) -> bool {
+        if self.app_id_match.is_none() && self.title_match.is_none() {
+            return false;
+        }
+        let app_ok = self
+            .app_id_match
+            .map(|needle| !app_id.is_empty() && app_id.contains(needle))
+            .unwrap_or(true);
+        let title_ok = self
+            .title_match
+            .map(|needle| !title.is_empty() && title.contains(needle))
+            .unwrap_or(true);
+        app_ok && title_ok
+    }
+}
+
+/// Stop matching once a rule hit, or once both `app_id` and title are known
+/// and nothing matched. A window that has only announced one of them stays
+/// open so the other can still select a rule.
+pub(crate) fn window_rules_settled(matched: bool, app_id: &str, title: &str) -> bool {
+    matched || (!app_id.is_empty() && !title.is_empty())
+}
+
 /// Built-in daily-driver window rules.
 pub const WINDOW_RULES: &[WindowRule] = &[
     // Spotlight launcher & purpwm Wi-Fi / Bluetooth / Polkit control popups always float centered
@@ -419,5 +446,9 @@ pub const POLKIT_COMMANDS: &[&[&str]] = &[
     &["/home/mag/Documents/purpwm/purpwm-polkit-agent"],
 ];
 
-/// Optional background daemons to autostart when `purpwm` launches (notification daemons, wallpaper, etc.).
-pub const AUTOSTART_COMMANDS: &[&[&str]] = &[&["mako"], &["dunst"]];
+/// Optional background commands started once at login.
+///
+/// Notification daemons are intentionally absent: purpwm owns
+/// `org.freedesktop.Notifications` itself, and starting `mako` or `dunst`
+/// afterwards takes that bus name away from the built-in toasts.
+pub const AUTOSTART_COMMANDS: &[&[&str]] = &[];

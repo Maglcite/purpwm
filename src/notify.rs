@@ -62,7 +62,15 @@ pub struct Notification {
     pub summary: String,
     pub body: String,
     pub urgency: u8,
-    pub expires_at: Instant,
+    /// `None` means the notification never expires (`expire_timeout` of 0).
+    pub expires_at: Option<Instant>,
+}
+
+/// One line from the built-in D-Bus listener.
+#[derive(Debug)]
+pub(crate) enum DbusLine {
+    Notify(Notification),
+    Close(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +85,7 @@ struct ToastDrawKey {
 /// Manages active notification toasts, D-Bus ingestion, hit-testing, and software rasterization.
 pub struct NotificationCenter {
     toasts: Vec<Notification>,
-    incoming: Arc<Mutex<Vec<Notification>>>,
+    incoming: Arc<Mutex<Vec<DbusLine>>>,
     buffer: MemoryRenderBuffer,
     last_drawn: Option<(i32, Vec<ToastDrawKey>)>,
 }
@@ -113,15 +121,22 @@ impl NotificationCenter {
         } else {
             NEXT_NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed)
         };
-        let duration =
-            Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1000, 30_000));
+        // `Some(0)` is the freedesktop "never expire" value. Other values keep
+        // the previous 1s..30s clamp used by in-process callers.
+        let expires_at = match timeout_ms {
+            Some(0) => None,
+            other => {
+                let ms = other.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1000, 30_000);
+                Some(Instant::now() + Duration::from_millis(ms))
+            }
+        };
         let toast = Notification {
             id,
             app_name: sanitize_line(&app_name.into()),
             summary: sanitize_line(&summary.into()),
             body: sanitize_line(&body.into()),
             urgency,
-            expires_at: Instant::now() + duration,
+            expires_at,
         };
 
         if let Some(existing) = self.toasts.iter_mut().find(|t| t.id == id) {
@@ -136,27 +151,45 @@ impl NotificationCenter {
         id
     }
 
+    /// Queue one listener line for the next [`Self::tick`].
+    pub(crate) fn ingest_line(&self, event: DbusLine) {
+        if let Ok(mut pending) = self.incoming.lock() {
+            pending.push(event);
+        }
+    }
+
     /// Drain incoming D-Bus notifications and expire timed-out toasts.
     /// Returns `true` if the visible toast list changed.
     pub fn tick(&mut self) -> bool {
         let mut changed = false;
         if let Ok(mut pending) = self.incoming.lock() {
-            for notif in pending.drain(..) {
-                if let Some(existing) = self.toasts.iter_mut().find(|t| t.id == notif.id) {
-                    *existing = notif;
-                } else {
-                    self.toasts.insert(0, notif);
-                    if self.toasts.len() > MAX_VISIBLE_TOASTS {
-                        self.toasts.truncate(MAX_VISIBLE_TOASTS);
+            for event in pending.drain(..) {
+                match event {
+                    DbusLine::Close(id) => {
+                        let before = self.toasts.len();
+                        self.toasts.retain(|t| t.id != id);
+                        if self.toasts.len() != before {
+                            changed = true;
+                        }
+                    }
+                    DbusLine::Notify(notif) => {
+                        if let Some(existing) = self.toasts.iter_mut().find(|t| t.id == notif.id) {
+                            *existing = notif;
+                        } else {
+                            self.toasts.insert(0, notif);
+                            if self.toasts.len() > MAX_VISIBLE_TOASTS {
+                                self.toasts.truncate(MAX_VISIBLE_TOASTS);
+                            }
+                        }
+                        changed = true;
                     }
                 }
-                changed = true;
             }
         }
 
         let now = Instant::now();
         let before = self.toasts.len();
-        self.toasts.retain(|t| t.expires_at > now);
+        self.toasts.retain(|t| t.expires_at.is_none_or(|exp| exp > now));
         if self.toasts.len() != before {
             changed = true;
         }
@@ -204,14 +237,15 @@ impl NotificationCenter {
         let Some(stack) = self.stack_geometry(output_width, bar_visible) else {
             return false;
         };
-        let p = point.to_i32_round();
-        if !stack.contains(p) {
+        // Integer rounding pushes a point on the inner edge (x.8) onto the
+        // exclusive bound, so the click misses the card.
+        if !stack.to_f64().contains(point) {
             return false;
         }
-        let rel_y = p.y - stack.loc.y;
-        let stride = TOAST_HEIGHT + TOAST_GAP;
-        let idx = (rel_y / stride) as usize;
-        let within_card = (rel_y % stride) < TOAST_HEIGHT;
+        let rel_y = point.y - stack.loc.y as f64;
+        let stride = (TOAST_HEIGHT + TOAST_GAP) as f64;
+        let idx = (rel_y / stride).floor() as usize;
+        let within_card = rel_y.rem_euclid(stride) < TOAST_HEIGHT as f64;
         if within_card && idx < self.toasts.len() {
             self.toasts.remove(idx);
             self.last_drawn = None;
@@ -385,6 +419,10 @@ XML = """<node>
     <method name="CloseNotification">
       <arg type="u" name="id" direction="in"/>
     </method>
+    <signal name="NotificationClosed">
+      <arg type="u" name="id"/>
+      <arg type="u" name="reason"/>
+    </signal>
     <method name="GetServerInformation">
       <arg type="s" name="name" direction="out"/>
       <arg type="s" name="vendor" direction="out"/>
@@ -407,13 +445,34 @@ def on_call(conn, sender, path, iface, method, params, invocation):
     elif method == "GetServerInformation":
         invocation.return_value(GLib.Variant("(ssss)", ("purpwm", "purpwm", "0.1.0", "1.2")))
     elif method == "CloseNotification":
+        nid = int(params.unpack()[0])
+        sys.stdout.write(f"close\t{nid}\n")
+        sys.stdout.flush()
+        try:
+            conn.emit_signal(
+                None,
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "NotificationClosed",
+                GLib.Variant("(uu)", (nid, 3)),
+            )
+        except Exception:
+            pass
         invocation.return_value(None)
     elif method == "Notify":
         app_name, replaces_id, _icon, summary, body, _actions, hints, timeout = params.unpack()
         nid = replaces_id if replaces_id > 0 else next_id
         if replaces_id == 0:
             next_id += 1
-        urgency = int(hints.get("urgency", 1)) if isinstance(hints, dict) else 1
+        urgency = 1
+        if isinstance(hints, dict) and "urgency" in hints:
+            raw = hints["urgency"]
+            if hasattr(raw, "unpack"):
+                raw = raw.unpack()
+            try:
+                urgency = int(raw)
+            except Exception:
+                urgency = 1
         sys.stdout.write(f"{nid}\t{urgency}\t{int(timeout)}\t{clean(app_name)}\t{clean(summary)}\t{clean(body)}\n")
         sys.stdout.flush()
         invocation.return_value(GLib.Variant("(u)", (nid,)))
@@ -458,9 +517,9 @@ loop.run()
         std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
-                if let Some(notif) = parse_dbus_notification_line(&line) {
+                if let Some(event) = parse_dbus_line(&line) {
                     if let Ok(mut guard) = incoming.lock() {
-                        guard.push(notif);
+                        guard.push(event);
                     }
                 }
             }
@@ -477,12 +536,16 @@ pub(crate) fn parse_dbus_notification_line(line: &str) -> Option<Notification> {
     let app_name = sanitize_line(parts.next().unwrap_or(""));
     let summary = sanitize_line(parts.next().unwrap_or(""));
     let body = sanitize_line(parts.next().unwrap_or(""));
-    let timeout_ms = if timeout_raw > 0 {
-        (timeout_raw as u64).clamp(1000, 30_000)
-    } else if urgency >= 2 {
-        12_000
+    // 0 = never expire. Negative = server default. Positive is the client's
+    // timeout (capped at a day so `Instant` cannot overflow).
+    let expires_at = if timeout_raw == 0 {
+        None
+    } else if timeout_raw < 0 {
+        let ms = if urgency >= 2 { 12_000 } else { DEFAULT_TIMEOUT_MS };
+        Some(Instant::now() + Duration::from_millis(ms))
     } else {
-        DEFAULT_TIMEOUT_MS
+        let ms = (timeout_raw as u64).clamp(1, 24 * 60 * 60 * 1000);
+        Some(Instant::now() + Duration::from_millis(ms))
     };
     Some(Notification {
         id,
@@ -490,8 +553,15 @@ pub(crate) fn parse_dbus_notification_line(line: &str) -> Option<Notification> {
         summary,
         body,
         urgency,
-        expires_at: Instant::now() + Duration::from_millis(timeout_ms),
+        expires_at,
     })
+}
+
+pub(crate) fn parse_dbus_line(line: &str) -> Option<DbusLine> {
+    if let Some(rest) = line.strip_prefix("close\t") {
+        return rest.trim().parse::<u32>().ok().map(DbusLine::Close);
+    }
+    parse_dbus_notification_line(line).map(DbusLine::Notify)
 }
 
 fn sanitize_line(s: &str) -> String {

@@ -84,6 +84,10 @@ pub struct ManagedWindow {
     pub size_from_client: bool,
     /// Whether the client's own size has been adopted at least once (first time also centres it).
     pub client_sized_once: bool,
+    /// Last `(app_id, title)` seen by the rule matcher. Rules stay open until a
+    /// rule matches or both strings are known, so a title that arrives after
+    /// `app_id` can still match.
+    pub rule_seen: (String, String),
 }
 
 impl ManagedWindow {
@@ -108,6 +112,7 @@ impl ManagedWindow {
             float_geo,
             size_from_client: false,
             client_sized_once: false,
+            rule_seen: (String::new(), String::new()),
         }
     }
 
@@ -209,14 +214,18 @@ impl ManagedWindow {
     }
 
     /// Inner surface size (excluding 2*BORDER_WIDTH).
+    ///
+    /// The minimum is 1, not a fixed 64×48: a tiled frame can legitimately be
+    /// smaller than that, and telling the client it is larger than its frame
+    /// makes it draw past the window (the compositor then crops it).
     #[inline]
     pub fn surface_size(&self) -> Size<i32, Logical> {
         if self.is_fullscreen {
             self.geo.size
         } else {
             Size::from((
-                (self.geo.size.w - 2 * BORDER_WIDTH).max(64),
-                (self.geo.size.h - 2 * BORDER_WIDTH).max(48),
+                (self.geo.size.w - 2 * BORDER_WIDTH).max(1),
+                (self.geo.size.h - 2 * BORDER_WIDTH).max(1),
             ))
         }
     }
@@ -244,6 +253,9 @@ impl ManagedWindow {
             if is_focused {
                 state.states.set(xdg_toplevel::State::Activated);
             }
+            // Maximize is not implemented: leave the bit clear so a client that
+            // asked for it is not stuck "maximized" at its tiled size.
+            state.states.unset(xdg_toplevel::State::Maximized);
             if self.is_fullscreen {
                 state.states.set(xdg_toplevel::State::Fullscreen);
             } else if is_tiled {
@@ -264,6 +276,98 @@ pub struct TagState {
     pub prev_layout: LayoutMode,
     pub mfact: f32,
     pub nmaster: usize,
+}
+
+/// Parts of `total` separated by `gap`, summing (with the gaps) back to `total`.
+/// Gaps shrink when they would otherwise push the parts past `total`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LengthSplit {
+    pub gap: i32,
+    pub lengths: Vec<i32>,
+}
+
+impl LengthSplit {
+    pub fn span(&self) -> i32 {
+        let n = self.lengths.len() as i32;
+        self.lengths.iter().sum::<i32>() + self.gap * (n - 1).max(0)
+    }
+}
+
+pub(crate) fn split_lengths(total: i32, count: usize, gap: i32) -> LengthSplit {
+    if count == 0 {
+        return LengthSplit {
+            gap: 0,
+            lengths: Vec::new(),
+        };
+    }
+    let total = total.max(0);
+    let count_i = count as i32;
+    let mut gap = gap.max(0);
+    if count > 1 {
+        let max_gaps = (total - count_i).max(0);
+        let wanted = gap * (count_i - 1);
+        if wanted > max_gaps {
+            gap = max_gaps / (count_i - 1);
+        }
+    } else {
+        gap = 0;
+    }
+    let gaps = gap * (count_i - 1).max(0);
+    let avail = total - gaps;
+    let base = avail / count_i;
+    let mut extra = avail % count_i;
+    let mut lengths = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut len = base;
+        if extra > 0 {
+            len += 1;
+            extra -= 1;
+        }
+        lengths.push(len);
+    }
+    LengthSplit { gap, lengths }
+}
+
+/// `(master, stack, gap)` widths that add up to `usable_w`.
+pub(crate) fn master_stack_widths(usable_w: i32, gap: i32, mfact: f32) -> (i32, i32, i32) {
+    let usable_w = usable_w.max(0);
+    if usable_w < 2 {
+        return (usable_w, 0, 0);
+    }
+    let gap = gap.max(0).min(usable_w - 2);
+    let inner = usable_w - gap;
+    let mfact = mfact.clamp(0.10, 0.90);
+    let master = ((inner as f32) * mfact).round() as i32;
+    let master = master.clamp(1, inner - 1);
+    (master, inner - master, gap)
+}
+
+/// `(left, master, right, gap)` for centered-master with a stack on both sides.
+/// The four numbers reconstruct `usable_w` (`left + gap + master + gap + right`).
+pub(crate) fn centered_side_widths(usable_w: i32, gap: i32, mfact: f32) -> (i32, i32, i32, i32) {
+    let usable_w = usable_w.max(0);
+    if usable_w < 3 {
+        return (0, usable_w, 0, 0);
+    }
+    let gap = gap.max(0).min((usable_w - 3) / 2);
+    let inner = usable_w - gap * 2;
+    let mfact = mfact.clamp(0.10, 0.90);
+    let master = ((inner as f32) * mfact).round() as i32;
+    let master = master.clamp(1, inner - 2);
+    let rem = inner - master;
+    (rem / 2, master, rem - rem / 2, gap)
+}
+
+/// Centred scratchpad rectangle that stays inside the output, below the bar.
+pub(crate) fn scratchpad_geo(output: Size<i32, Logical>, show_bar: bool) -> Rectangle<i32, Logical> {
+    let top = if show_bar { BAR_HEIGHT } else { 0 };
+    let max_w = (output.w - 16).max(1);
+    let max_h = (output.h - top - 16).max(1);
+    let sw = ((output.w * 7 / 10).max(480)).min(max_w).max(1);
+    let sh = ((output.h * 7 / 10).max(320)).min(max_h).max(1);
+    let sx = ((output.w - sw) / 2).clamp(0, (output.w - sw).max(0));
+    let sy = (top + ((output.h - top - sh) / 2).max(0)).clamp(0, (output.h - sh).max(0));
+    Rectangle::new(Point::from((sx, sy)), Size::from((sw, sh)))
 }
 
 impl Default for TagState {
@@ -392,8 +496,8 @@ impl Workspace {
         let usable = Rectangle::<i32, Logical>::new(
             Point::from((g_outer, bar_y + g_outer)),
             Size::from((
-                (output_size.w - 2 * g_outer).max(100),
-                (output_size.h - bar_y - 2 * g_outer).max(100),
+                (output_size.w - 2 * g_outer).max(1),
+                (output_size.h - bar_y - 2 * g_outer).max(1),
             )),
         );
 
@@ -430,13 +534,19 @@ impl Workspace {
             LayoutMode::Tile => {
                 if n > 0 {
                     let nmaster = nmaster_cfg.min(n);
-                    let master_w = if n > nmaster && nmaster > 0 {
-                        ((usable.size.w - g_inner) as f32 * mfact).round() as i32
+                    if nmaster == 0 || nmaster >= n {
+                        Self::arrange_column(
+                            windows,
+                            &tiled_indices,
+                            usable.loc.x,
+                            usable.loc.y,
+                            usable.size.w,
+                            usable.size.h,
+                            g_inner,
+                        );
                     } else {
-                        usable.size.w
-                    };
-
-                    if nmaster > 0 {
+                        let (master_w, stack_w, col_gap) =
+                            master_stack_widths(usable.size.w, g_inner, mfact);
                         Self::arrange_column(
                             windows,
                             &tiled_indices[..nmaster],
@@ -446,24 +556,10 @@ impl Workspace {
                             usable.size.h,
                             g_inner,
                         );
-                    }
-
-                    let nstack = n.saturating_sub(nmaster);
-                    if nstack > 0 {
-                        let stack_x = if nmaster > 0 {
-                            usable.loc.x + master_w + g_inner
-                        } else {
-                            usable.loc.x
-                        };
-                        let stack_w = if nmaster > 0 {
-                            (usable.size.w - master_w - g_inner).max(64)
-                        } else {
-                            usable.size.w
-                        };
                         Self::arrange_column(
                             windows,
                             &tiled_indices[nmaster..],
-                            stack_x,
+                            usable.loc.x + master_w + col_gap,
                             usable.loc.y,
                             stack_w,
                             usable.size.h,
@@ -488,11 +584,10 @@ impl Workspace {
                     } else {
                         let stack_slice = &tiled_indices[nmaster..];
                         let nstack = stack_slice.len();
-                        let master_w = (usable.size.w as f32 * mfact).round() as i32;
 
                         if nstack == 1 {
-                            let mw = ((usable.size.w - g_inner) as f32 * mfact).round() as i32;
-                            let sw = (usable.size.w - mw - g_inner).max(64);
+                            let (mw, sw, col_gap) =
+                                master_stack_widths(usable.size.w, g_inner, mfact);
                             Self::arrange_column(
                                 windows,
                                 &tiled_indices[..nmaster],
@@ -505,18 +600,17 @@ impl Workspace {
                             Self::arrange_column(
                                 windows,
                                 stack_slice,
-                                usable.loc.x + mw + g_inner,
+                                usable.loc.x + mw + col_gap,
                                 usable.loc.y,
                                 sw,
                                 usable.size.h,
                                 g_inner,
                             );
                         } else {
-                            let rem_w = (usable.size.w - master_w - 2 * g_inner).max(128);
-                            let left_w = rem_w / 2;
-                            let right_w = rem_w - left_w;
-                            let master_x = usable.loc.x + left_w + g_inner;
-                            let right_x = master_x + master_w + g_inner;
+                            let (left_w, master_w, right_w, col_gap) =
+                                centered_side_widths(usable.size.w, g_inner, mfact);
+                            let master_x = usable.loc.x + left_w + col_gap;
+                            let right_x = master_x + master_w + col_gap;
 
                             Self::arrange_column(
                                 windows,
@@ -567,8 +661,8 @@ impl Workspace {
                 if n > 0 {
                     let cols = (n as f64).sqrt().ceil() as usize;
                     let rows = n.div_ceil(cols);
-                    let total_col_gaps = g_inner * (cols as i32 - 1).max(0);
-                    let cell_w = ((usable.size.w - total_col_gaps) / cols as i32).max(64);
+                    let split = split_lengths(usable.size.w, cols, g_inner);
+                    let mut cx = usable.loc.x;
 
                     for c in 0..cols {
                         let start_idx = c * rows;
@@ -577,12 +671,7 @@ impl Workspace {
                         }
                         let end_idx = ((c + 1) * rows).min(n);
                         let col_slice = &tiled_indices[start_idx..end_idx];
-                        let cx = usable.loc.x + (c as i32) * (cell_w + g_inner);
-                        let cw = if c + 1 == cols {
-                            (usable.loc.x + usable.size.w - cx).max(64)
-                        } else {
-                            cell_w
-                        };
+                        let cw = split.lengths[c];
                         Self::arrange_column(
                             windows,
                             col_slice,
@@ -592,6 +681,7 @@ impl Workspace {
                             usable.size.h,
                             g_inner,
                         );
+                        cx += cw + split.gap;
                     }
                 }
             }
@@ -631,18 +721,13 @@ impl Workspace {
         if count == 0 {
             return;
         }
-        let total_gaps = gap_inner * (count as i32 - 1).max(0);
-        let each_h = ((total_h - total_gaps) / count as i32).max(48);
+        let split = split_lengths(total_h, count, gap_inner);
         let mut cur_y = y;
 
         for (pos, &win_idx) in indices.iter().enumerate() {
-            let h = if pos + 1 == count {
-                (y + total_h - cur_y).max(48)
-            } else {
-                each_h
-            };
+            let h = split.lengths[pos];
             windows[win_idx].geo = Rectangle::new(Point::from((x, cur_y)), Size::from((w, h)));
-            cur_y += h + gap_inner;
+            cur_y += h + split.gap;
         }
     }
 }

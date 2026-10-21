@@ -66,9 +66,14 @@ else
     PURPWM_BIN="purpwm"
 fi
 
-# Detect native DRM panel resolution (e.g. 2560x1600 on card1-eDP-1)
+# Detect native DRM panel resolution. An internal panel (eDP/LVDS/DSI) wins
+# over whichever connected connector happens to sort first.
 NATIVE_W=2560
 NATIVE_H=1600
+INTERNAL_W=""
+INTERNAL_H=""
+EXTERNAL_W=""
+EXTERNAL_H=""
 for d in /sys/class/drm/card*-*; do
     if [ -f "$d/status" ] && [ "$(cat "$d/status" 2>/dev/null)" = "connected" ] && [ -f "$d/modes" ]; then
         MODE="$(head -n 1 "$d/modes" 2>/dev/null)"
@@ -76,13 +81,32 @@ for d in /sys/class/drm/card*-*; do
             W="${MODE%x*}"
             H="${MODE#*x}"
             if [ "$W" -ge 640 ] 2>/dev/null && [ "$H" -ge 480 ] 2>/dev/null; then
-                NATIVE_W="$W"
-                NATIVE_H="$H"
-                break
+                NAME="$(basename "$d")"
+                case "$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')" in
+                    *edp*|*lvds*|*dsi*)
+                        if [ -z "$INTERNAL_W" ]; then
+                            INTERNAL_W="$W"
+                            INTERNAL_H="$H"
+                        fi
+                        ;;
+                    *)
+                        if [ -z "$EXTERNAL_W" ]; then
+                            EXTERNAL_W="$W"
+                            EXTERNAL_H="$H"
+                        fi
+                        ;;
+                esac
             fi
         fi
     fi
 done
+if [ -n "$INTERNAL_W" ]; then
+    NATIVE_W="$INTERNAL_W"
+    NATIVE_H="$INTERNAL_H"
+elif [ -n "$EXTERNAL_W" ]; then
+    NATIVE_W="$EXTERNAL_W"
+    NATIVE_H="$EXTERNAL_H"
+fi
 
 # Check if running nested (inside an existing Wayland or X11 compositor)
 # or standalone (launched from COSMIC greeter / greetd on VT)
