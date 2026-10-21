@@ -9,7 +9,7 @@ mod tests {
     };
 
     use crate::{
-        bar::{wifi_label_from_nmcli, BarClickAction, StatusBar},
+        bar::{wifi_label_from_nmcli, BarClickAction, StatusBar, BUNDLED_FONT},
         config::{window_rules_settled, BAR_HEIGHT, GAP_INNER, GAP_OUTER, WindowRule},
         help::{rasterize, HelpOverlay},
         input::{keysym_to_lock_key, KeyAction},
@@ -330,6 +330,14 @@ mod tests {
         assert!(pad.loc.x >= 0 && pad.loc.y >= BAR_HEIGHT);
         assert!(pad.loc.x + pad.size.w <= 200);
         assert!(pad.loc.y + pad.size.h <= 180);
+    }
+
+    #[test]
+    fn test_bundled_font_renders_text() {
+        let font = fontdue::Font::from_bytes(BUNDLED_FONT, fontdue::FontSettings::default())
+            .expect("bundled font parses");
+        let (metrics, bitmap) = font.rasterize('A', 16.0);
+        assert!(metrics.width > 0 && bitmap.iter().any(|&a| a > 0));
     }
 
     #[test]

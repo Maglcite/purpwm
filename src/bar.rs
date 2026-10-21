@@ -290,21 +290,32 @@ impl StatusBar {
     }
 
     fn load_system_font() -> Option<Font> {
-        let configured = std::env::var("PURPWM_FONT").ok();
-        for path in configured
+        let load = |path: &str| {
+            let bytes = fs::read(path).ok()?;
+            match Font::from_bytes(bytes, FontSettings::default()) {
+                Ok(font) => {
+                    tracing::info!("Loaded status bar font: {}", path);
+                    Some(font)
+                }
+                Err(err) => {
+                    tracing::warn!("Unusable status bar font {}: {}", path, err);
+                    None
+                }
+            }
+        };
+        let configured = std::env::var("PURPWM_FONT").ok().filter(|p| !p.is_empty());
+        configured
             .as_deref()
             .into_iter()
             .chain(FONT_PATHS.iter().copied())
-        {
-            if let Ok(bytes) = fs::read(path) {
-                if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
-                    tracing::info!("Loaded status bar font: {}", path);
-                    return Some(font);
-                }
-            }
-        }
-        tracing::warn!("No TTF font found in FONT_PATHS; using built-in fallback");
-        None
+            .find_map(load)
+            // Only ask fontconfig when none of the known paths exist on this distro.
+            .or_else(|| fontconfig_monospace().as_deref().and_then(load))
+            .or_else(|| {
+                // Text must never disappear: the lock screen and help overlay use this font too.
+                tracing::warn!("No system font usable; using the bundled DejaVu Sans Mono");
+                Font::from_bytes(BUNDLED_FONT, FontSettings::default()).ok()
+            })
     }
 
     /// The loaded status bar font (shared with the lock screen).
@@ -933,6 +944,20 @@ impl StatusBar {
             });
         }
     }
+}
+
+/// Last-resort status bar font, compiled in (see `assets/fonts/DejaVuSansMono-LICENSE`).
+pub(crate) const BUNDLED_FONT: &[u8] = include_bytes!("../assets/fonts/DejaVuSansMono.ttf");
+
+/// The system's monospace font according to fontconfig, if `fc-match` is installed.
+fn fontconfig_monospace() -> Option<String> {
+    let output = Command::new("fc-match")
+        .args(["-f", "%{file}", "monospace"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let path = String::from_utf8(output.stdout).ok()?;
+    (output.status.success() && !path.is_empty()).then_some(path)
 }
 
 /// Prefer a connected wifi device over an earlier disconnected adapter.

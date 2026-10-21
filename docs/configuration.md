@@ -76,7 +76,7 @@ All other sizes in this file are in **logical** pixels and get multiplied by the
 | `DEFAULT_NMASTER` | `1` | Windows in the master area |
 | `MOVE_STEP` / `RESIZE_STEP` | `40` | Pixels per `Mod + Arrow` / `Mod + Shift + Arrow` |
 | `TAG_NAMES` | `"1"`…`"9"` | Tag labels shown in the bar |
-| `FONT_PATHS` | JetBrains Mono, DejaVu Sans Mono, ... | TTF files tried in order for the bar |
+| `FONT_PATHS` | JetBrains Mono, DejaVu Sans Mono, ... | TTF files tried in order for the bar, after `PURPWM_FONT`; then fontconfig's `monospace`, then the bundled DejaVu Sans Mono |
 
 ## Theme
 

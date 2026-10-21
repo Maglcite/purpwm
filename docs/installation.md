@@ -99,7 +99,7 @@ saved as `session.conf.bak`. Theme, layouts and keybindings remain compile-time 
 | Flameshot bar button | `flameshot`, `xdg-desktop-portal`, `xdg-desktop-portal-gtk`, Python 3 / PyGObject / GTK 4; native `purpwm-portal` backend |
 | Polkit dialog | Python 3, PyGObject, GTK 4, `polkit` (GI typelibs `Polkit-1.0`, `PolkitAgent-1.0`) |
 | Keyring | `gnome-keyring`, Python 3, PyGObject and `libsecret`; optional `seahorse` manager, `gcr-4` SSH agent |
-| Status bar font | Any TTF from `FONT_PATHS` (JetBrains Mono, DejaVu Sans Mono, ...) |
+| Status bar font | Optional: `PURPWM_FONT`, a file from `FONT_PATHS`, or fontconfig's monospace font; DejaVu Sans Mono is bundled as a fallback |
 
 On Arch / CachyOS, for example:
 

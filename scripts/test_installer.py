@@ -171,6 +171,15 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("--keyring-pam", result.stderr)
         self.assertFalse((self.root / "stage").exists())
 
+    def test_font_must_be_an_outline_font(self):
+        bitmap = self.root / "terminus.pcf"
+        bitmap.write_bytes(b"\x01fcp" + bytes(60))
+        with self.assertRaises(ValueError):
+            setup.font_path(str(bitmap))
+        outline = self.root / "mono.ttf"
+        outline.write_bytes(b"\x00\x01\x00\x00" + bytes(60))
+        self.assertEqual(setup.font_path(str(outline)), str(outline))
+
     def test_pam_distro_selection_and_unknown_stack(self):
         directory = self.root / "pam"
         directory.mkdir()

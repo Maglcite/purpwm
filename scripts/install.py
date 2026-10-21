@@ -234,16 +234,28 @@ def resolve_program(value, candidates=()):
     return found
 
 
+def is_outline_font(path):
+    # The bar's rasterizer reads TrueType/OpenType (and collections), not bitmap or web fonts.
+    try:
+        with open(path, "rb") as font:
+            return font.read(4) in (b"\x00\x01\x00\x00", b"OTTO", b"true", b"ttcf")
+    except OSError:
+        return False
+
+
 def font_path(value):
     if value != "auto":
         path = absolute_path(value, user_home())
         if not path.is_file():
             raise ValueError(f"Font file not found: {path}")
+        if not is_outline_font(path):
+            raise ValueError(f"Not a TrueType/OpenType font: {path}")
         return str(path)
     if shutil.which("fc-match"):
         result = subprocess.run(["fc-match", "-f", "%{file}", "monospace"], capture_output=True, text=True)
-        if result.returncode == 0 and Path(result.stdout).is_file():
+        if result.returncode == 0 and is_outline_font(result.stdout):
             return result.stdout
+    # purpwm also asks fontconfig at startup and has a bundled fallback font.
     return ""
 
 
