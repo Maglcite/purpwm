@@ -53,7 +53,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Mod + j  /  k", "Focus next / previous"),
             ("Mod + Shift + Return", "Swap with master"),
             ("Mod + Arrows", "Move window"),
-            ("Mod + Shift + Arrows", "Resize window"),
+            ("Mod + Shift + Arrows", "Resize (hold to glide)"),
             ("Mod + Shift + Space", "Toggle floating"),
             ("Mod + Shift + f  /  F11", "Fullscreen"),
             ("Mod + o", "Fully opaque window"),

@@ -102,12 +102,13 @@ use crate::{
         BRIGHTNESS_UP_COMMANDS, DEFAULT_SCALE, FLAMESHOT_COMMANDS, KEYRING_COMMANDS,
         LAUNCHER_COMMANDS, MEDIA_NEXT_COMMANDS, MEDIA_PLAY_COMMANDS, MEDIA_PREV_COMMANDS,
         MIC_MUTE_COMMANDS, MIXER_COMMANDS, MOVE_STEP,
-        POLKIT_COMMANDS, RESIZE_STEP, SCALE_MAX, SCALE_MIN, SCALE_STEP, SCREENSHOT_DIR,
+        POLKIT_COMMANDS, SCALE_MAX, SCALE_MIN, SCALE_STEP, SCREENSHOT_DIR,
         SCREENSHOT_PORTAL_COMMANDS, SYSTEM_MONITOR_COMMANDS, TAGMASK, TERMINAL_COMMANDS,
         VOL_DOWN_COMMANDS, VOL_MUTE_COMMANDS,
         VOL_UP_COMMANDS, WIFI_COMMANDS, WINDOW_RULES, window_rules_settled,
     },
     cursor::CursorTheme,
+    glide::KeyGlide,
     help::HelpOverlay,
     lock::{LockPoll, LockScreen},
     notify::NotificationCenter,
@@ -244,6 +245,13 @@ impl InteractiveGrab {
             } => *forward_release,
         }
     }
+}
+
+/// `Mod + Shift + Arrow` resize in progress on the window owning `surface`.
+#[derive(Debug, Clone)]
+pub struct KeyResize {
+    pub surface: WlSurface,
+    pub glide: KeyGlide,
 }
 
 /// Pending built-in screenshot (`Print` = whole screen, `Shift/Mod + Print` = focused window).
@@ -406,6 +414,8 @@ pub struct PurpState {
     pub layer_focus: Option<WlSurface>,
     pub focused_idx: Option<usize>,
     pub active_grab: Option<InteractiveGrab>,
+    /// Held `Mod + Shift + Arrow` keys gliding a window edge (advanced once per frame).
+    pub key_resize: Option<KeyResize>,
 
     // Built-in screenshots: request is served by the next rendered frame, the encoded PNG
     // comes back from the encoder thread and is offered on the clipboard.
@@ -536,6 +546,7 @@ impl PurpState {
             layer_focus: None,
             focused_idx: None,
             active_grab: None,
+            key_resize: None,
             screenshot_request: None,
             screenshot_tx,
             screenshot_rx,
@@ -566,6 +577,7 @@ impl PurpState {
         }
         self.help.visible = false;
         self.active_grab = None;
+        self.key_resize = None;
         self.touch_grab_slot = None;
         self.touch_locations.clear();
         self.mod_tap_candidate = false;
@@ -970,32 +982,29 @@ impl PurpState {
         self.relayout();
     }
 
-    /// Resize the focused window with `Mod + Shift + Arrow` keys. A tiled window stays tiled:
-    /// the master/stack split and its neighbour in the column give way.
-    pub fn resize_focused_window(&mut self, dw: i32, dh: i32) {
-        let Some(focused) = self.focused_idx else {
-            return;
-        };
-        if focused >= self.windows.len() {
+    /// Keyboard resize (`Mod + Shift + Arrow`): move window `idx`'s right / bottom edge
+    /// `dx` / `dy` logical pixels. A tiled window stays tiled and the split beside it
+    /// moves instead, always the way the arrow points: `Right` pushes the master/stack
+    /// divider right whether the master or a stack window is focused, like `Mod + ]`.
+    pub fn resize_window_by(&mut self, idx: usize, dx: i32, dy: i32) {
+        if self.windows.get(idx).is_none_or(|w| w.is_fullscreen) {
             return;
         }
 
-        if let Some(plan) = self.tiled_resize_plan(focused, ResizeEdges::BOTTOM_RIGHT) {
-            let dx = dw * RESIZE_STEP * plan.mfact.map_or(0, |m| m.grow);
-            let dy = dh * RESIZE_STEP * plan.rows.as_ref().map_or(0, |r| r.grow);
+        if let Some(plan) = self.tiled_resize_plan(idx, ResizeEdges::BOTTOM_RIGHT) {
             self.apply_tiled_resize(&plan, dx, dy);
             return;
         }
 
-        let w = &mut self.windows[focused];
+        let w = &mut self.windows[idx];
         if !w.is_floating && !w.is_scratchpad {
             w.is_floating = true;
             w.float_geo = w.geo;
         }
         w.size_from_client = false;
         let wanted = Size::from((
-            (w.float_geo.size.w + dw * RESIZE_STEP).max(120),
-            (w.float_geo.size.h + dh * RESIZE_STEP).max(80),
+            (w.float_geo.size.w + dx).max(120),
+            (w.float_geo.size.h + dy).max(80),
         ));
         w.float_geo.size = w.clamp_frame_to_client_limits(wanted);
         w.geo = w.float_geo;

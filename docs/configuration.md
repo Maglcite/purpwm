@@ -80,7 +80,10 @@ All other sizes in this file are in **logical** pixels and get multiplied by the
 | `GAP_INNER` / `GAP_OUTER` | `6` / `8` | Gaps between windows / to the screen edges |
 | `DEFAULT_MFACT` | `0.55` | Master area width (0.1–0.9) |
 | `DEFAULT_NMASTER` | `1` | Windows in the master area |
-| `MOVE_STEP` / `RESIZE_STEP` | `40` | Pixels per `Mod + Arrow` / `Mod + Shift + Arrow` |
+| `MOVE_STEP` | `40` | Pixels per `Mod + Arrow` nudge of a floating window |
+| `RESIZE_STEP` | `16.0` | Pixels one tap of `Mod + Shift + Arrow` glides |
+| `RESIZE_SPEED_MIN` / `RESIZE_SPEED_MAX` | `240.0` / `1400.0` | Resize glide speed (px/s) when the arrow goes down / after `RESIZE_RAMP_SECS` held |
+| `RESIZE_RAMP_SECS` | `0.8` | Seconds a held `Mod + Shift + Arrow` takes to reach full speed |
 | `TAG_NAMES` | `"1"`…`"9"` | Tag labels shown in the bar |
 | `FONT_PATHS` | JetBrains Mono, DejaVu Sans Mono, ... | TTF files tried in order for the bar, after `PURPWM_FONT`; then fontconfig's `monospace`, then the bundled DejaVu Sans Mono |
 

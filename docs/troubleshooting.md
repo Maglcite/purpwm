@@ -59,6 +59,15 @@ the D-Bus display environment. For automatic unlock on password login, follow
 [OS keyring setup](installation.md#os-keyring); starting the daemon alone cannot
 unlock an encrypted keyring. Autologin requires a manual unlock.
 
+**A terminal (Alacritty) isn't transparent**
+purpwm blends whatever alpha the app draws, so check the app's own setting first
+(`[window] opacity = 0.75` for Alacritty). If that is set and the window is still solid,
+the config file probably failed to parse: Alacritty then ignores the **whole** file. A
+common cause is a tool appending a `[[keyboard.bindings]]` table to a config that already
+has `bindings = [ ... ]` under `[keyboard]`. Start `alacritty` from another terminal: it
+prints `Unable to load config ... duplicate key` with the offending line. Merge the extra
+binding into the existing list.
+
 **Wi-Fi / Bluetooth pill says `N/A`**
 `nmcli` or `bluetoothctl` isn't installed, or NetworkManager / `bluetoothd` isn't running
 (`systemctl status NetworkManager bluetooth`).

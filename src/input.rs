@@ -12,6 +12,8 @@
 //! - Hardware media/volume/brightness/screenshot keys (`XF86Audio*`, `XF86MonBrightness*`, `Print`)
 //! - Mouse scroll-wheel (`PointerAxis`) forwarding and status bar wheel tag switching
 
+use std::time::Instant;
+
 use smithay::{
     backend::input::{
         Axis, AxisSource, ButtonState, Event, InputBackend, KeyState, Keycode, PointerAxisEvent,
@@ -32,8 +34,9 @@ use smithay::{
 use crate::{
     bar::BarClickAction,
     config::{BAR_HEIGHT, SCALE_STEP, TAGMASK, TAG_NAMES},
+    glide::KeyGlide,
     lock::LockKey,
-    state::{InteractiveGrab, PurpState},
+    state::{InteractiveGrab, KeyResize, PurpState},
     wm::LayoutMode,
 };
 
@@ -425,8 +428,18 @@ impl PurpState {
                 self.intercepted_keys.push(keycode);
             }
         }
-        if let Some(Some(act)) = intercepted {
-            self.execute_key_action(act);
+        match intercepted {
+            // Held arrows glide until they come up, so the press needs the keycode.
+            Some(Some(KeyAction::ResizeWindow(dw, dh))) => {
+                self.press_resize_key(Some(keycode), dw, dh);
+            }
+            Some(Some(act)) => self.execute_key_action(act),
+            _ => {}
+        }
+        if state == KeyState::Released {
+            if let Some(resize) = &mut self.key_resize {
+                resize.glide.release(keycode);
+            }
         }
         if solo_mod_tap {
             self.spawn_launcher();
@@ -452,7 +465,7 @@ impl PurpState {
             KeyAction::Quit => self.should_quit = true,
             KeyAction::FocusDelta(delta) => self.cycle_focus(delta),
             KeyAction::MoveWindow(dx, dy) => self.move_focused_window(dx, dy),
-            KeyAction::ResizeWindow(dw, dh) => self.resize_focused_window(dw, dh),
+            KeyAction::ResizeWindow(dw, dh) => self.press_resize_key(None, dw, dh),
             KeyAction::AdjustMfact(delta) => {
                 self.workspace.adjust_mfact(delta);
                 self.relayout();
@@ -511,6 +524,67 @@ impl PurpState {
             KeyAction::Screenshot => self.request_screenshot(false),
             KeyAction::ScreenshotWindow => self.request_screenshot(true),
         }
+    }
+
+    /// `Mod + Shift + Arrow` went down: glide the focused window's edge in `(dw, dh)` until
+    /// the key comes up. `keycode: None` (no physical key) glides one tap's worth.
+    pub fn press_resize_key(&mut self, keycode: Option<Keycode>, dw: i32, dh: i32) {
+        let Some(surface) = self
+            .focused_idx
+            .and_then(|idx| self.windows.get(idx))
+            .filter(|w| !w.is_fullscreen)
+            .map(|w| w.wl_surface().clone())
+        else {
+            return;
+        };
+        let now = Instant::now();
+        if self
+            .key_resize
+            .as_ref()
+            .is_none_or(|r| r.surface != surface)
+        {
+            self.key_resize = Some(KeyResize {
+                surface,
+                glide: KeyGlide::new(now),
+            });
+        }
+        if let Some(resize) = &mut self.key_resize {
+            resize.glide.press(keycode, (dw, dh), now);
+        }
+    }
+
+    /// Advance a keyboard resize by one frame; returns whether the frame needs redrawing
+    /// (the edge moved or is still gliding). Letting go of `Mod` or `Shift` stops it like
+    /// releasing the arrow does.
+    pub fn tick_key_resize(&mut self) -> bool {
+        let still_bound = is_mod_active(&self.modifiers) && self.modifiers.shift;
+        let tags = self.workspace.selected_tags;
+        let locked = self.is_locked();
+        let Some(resize) = &mut self.key_resize else {
+            return false;
+        };
+        if !still_bound {
+            resize.glide.release_all();
+        }
+        let (dx, dy) = resize.glide.advance(Instant::now());
+        let done = resize.glide.is_done();
+        let idx = self
+            .windows
+            .iter()
+            .position(|w| w.wl_surface() == &resize.surface)
+            .filter(|&idx| !locked && self.windows[idx].is_visible_on(tags));
+        let Some(idx) = idx else {
+            self.key_resize = None;
+            return false;
+        };
+        let moved = dx != 0 || dy != 0;
+        if moved {
+            self.resize_window_by(idx, dx, dy);
+        }
+        if done {
+            self.key_resize = None;
+        }
+        moved || !done
     }
 
     /// Apply an active interactive window move/resize grab for the given pointer/touch location.

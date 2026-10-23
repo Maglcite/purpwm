@@ -22,6 +22,7 @@ clients into that window with OpenGL ES.
 | `src/state.rs` | `PurpState`: protocol globals and handlers, focus, stacking order, hit-testing, popups, layer shell, touch/lock/notification/help integration, spawning commands, scale |
 | `src/wm.rs` | dwm tiling engine: `ManagedWindow`, `Workspace`, per-tag state and the five layouts |
 | `src/input.rs` | Keybindings, solo-`Mod` tap, pointer motion / buttons / scroll, native `wl_touch` routing, status-bar clicks/taps, interactive move / resize |
+| `src/glide.rs` | Smooth `Mod + Shift + Arrow` resizing (`KeyGlide`): held arrows glide the edge with eased acceleration, advanced once per frame |
 | `src/help.rs` | Built-in `Mod + h` keybinding cheat sheet overlay (`HelpOverlay`, multi-column software-rasterised panel) |
 | `src/cursor.rs` | System XCursor theme loader (`XCURSOR_THEME` / `XCURSOR_SIZE`) and scaled cursor rendering |
 | `src/lock.rs` | Built-in full-screen purple PAM screen locker (`LockScreen`, worker-thread PAM conversation) |
@@ -47,9 +48,11 @@ Each iteration:
 1. Pump winit events (keyboard, pointer, touch, resize, close).
 2. Accept new clients and dispatch their requests.
 3. Handle pending `SIGUSR1` (screenshot) and `SIGUSR2` (lock screen) signals, and hand finished screenshots to the clipboard.
-4. Poll the background status thread, PAM lock-screen worker, and D-Bus notification queue.
-5. Render only if something happened (input, client requests, status/lock/notification change, active drag,
-   screenshot). Otherwise sleep 8 ms, so an idle desktop uses almost no CPU.
+4. Poll the background status thread, PAM lock-screen worker, and D-Bus notification queue, and
+   advance a held `Mod + Shift + Arrow` resize by one frame (winit never delivers key repeats, so
+   the glide is driven from here).
+5. Render only if something happened (input, client requests, status/lock/notification change, active drag
+   or keyboard resize, screenshot). Otherwise sleep 8 ms, so an idle desktop uses almost no CPU.
 6. Before rendering, if the window size or scale changed, update the `wl_output` mode and
    scale, recompute the logical output size and relayout.
 7. After rendering, send frame callbacks to **visible** surfaces only (and none while the session is locked), so clients on hidden

@@ -3,6 +3,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use smithay::{
+        backend::input::Keycode,
         input::keyboard::{keysyms, Keysym, ModifiersState},
         reexports::wayland_server::Display,
         utils::{Logical, Physical, Point, Rectangle, Size},
@@ -10,7 +11,11 @@ mod tests {
 
     use crate::{
         bar::{wifi_label_from_nmcli, BarClickAction, StatusBar, BUNDLED_FONT},
-        config::{window_rules_settled, BAR_HEIGHT, GAP_INNER, GAP_OUTER, WindowRule},
+        config::{
+            window_rules_settled, WindowRule, BAR_HEIGHT, GAP_INNER, GAP_OUTER, RESIZE_RAMP_SECS,
+            RESIZE_SPEED_MAX, RESIZE_SPEED_MIN, RESIZE_STEP,
+        },
+        glide::{glide_speed, KeyGlide},
         help::{rasterize, HelpOverlay},
         input::{keysym_to_lock_key, KeyAction},
         lock::{pam_check, LockKey, LockPoll, LockScreen, CONVERSATIONS},
@@ -384,13 +389,26 @@ mod tests {
                 .plan_tiled_resize(output, &tiled, 0, e)
                 .mfact
                 .expect("master divider");
-            assert_eq!(split.grow, 1);
             assert!((split.start + split.per_px * 97.0 - (start + 0.1)).abs() < 1e-4);
         }
         // The stack's left edge is the same divider, and it does not touch the rows.
         let stack = ws.plan_tiled_resize(output, &tiled, 1, edges(true, false, false, false));
-        assert_eq!(stack.mfact.expect("stack divider").grow, -1);
+        assert!(stack.mfact.is_some());
         assert!(stack.rows.is_none());
+
+        // Keyboard resize (bottom-right edges) moves the divider the way the arrow points for
+        // every window: `Right` (+x) pushes it right, i.e. raises `mfact`, even from the stack
+        // window whose own right edge is the screen edge.
+        for idx in [0, 1, 2] {
+            let split = ws
+                .plan_tiled_resize(output, &tiled, idx, ResizeEdges::BOTTOM_RIGHT)
+                .mfact
+                .expect("keyboard divider");
+            assert!(
+                split.per_px > 0.0,
+                "window {idx}: Right must move the divider right"
+            );
+        }
 
         // Bottom edge of the upper stack window: the row divider follows the pointer and
         // the windows keep their minimum height.
@@ -398,18 +416,21 @@ mod tests {
             .plan_tiled_resize(output, &tiled, 1, edges(false, false, false, true))
             .rows
             .expect("row divider");
-        assert_eq!((rows.upper, rows.lower, rows.grow), (1, 2, 1));
+        assert_eq!((rows.upper, rows.lower), (1, 2));
         let (upper, lower) = rows.cfacts(100);
         assert!((upper * rows.px_per_cfact - 570.0).abs() < 0.01);
         assert!((upper + lower - 2.0).abs() < 1e-4);
         let (_, lower) = rows.cfacts(10_000);
         assert!((lower * rows.px_per_cfact - 80.0).abs() < 0.01);
         // The last window in a column has no lower neighbour: use the divider above it.
+        // `Down` (+y) still moves that divider down, shrinking the last window.
         let last = ws
             .plan_tiled_resize(output, &tiled, 2, edges(false, false, false, true))
             .rows
             .expect("row above");
-        assert_eq!((last.upper, last.lower, last.grow), (1, 2, -1));
+        assert_eq!((last.upper, last.lower), (1, 2));
+        let (upper, lower) = last.cfacts(40);
+        assert!(upper * last.px_per_cfact > 470.0 && lower * last.px_per_cfact < 470.0);
         // A lone column window has no row divider.
         assert!(ws
             .plan_tiled_resize(output, &tiled, 0, edges(false, true, false, false))
@@ -431,6 +452,85 @@ mod tests {
         ws.set_layout(LayoutMode::Monocle);
         let monocle = ws.plan_tiled_resize(output, &tiled, 0, edges(false, false, true, true));
         assert!(monocle.mfact.is_none() && monocle.rows.is_none());
+    }
+
+    /// Sum the motion of `glide` over 8 ms frames from `t` until it finishes or `frames` run
+    /// out, checking no single frame jumps more than `max_frame_px`.
+    fn run_glide(
+        glide: &mut KeyGlide,
+        t: &mut Instant,
+        frames: usize,
+        max_frame_px: i32,
+    ) -> (i32, i32) {
+        let mut total = (0, 0);
+        for _ in 0..frames {
+            *t += Duration::from_millis(8);
+            let (dx, dy) = glide.advance(*t);
+            assert!(
+                dx.abs() <= max_frame_px && dy.abs() <= max_frame_px,
+                "frame jumped ({dx}, {dy})"
+            );
+            total = (total.0 + dx, total.1 + dy);
+            if glide.is_done() {
+                break;
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn test_keyboard_resize_glides_smoothly() {
+        assert_eq!(glide_speed(0.0), RESIZE_SPEED_MIN);
+        assert_eq!(glide_speed(RESIZE_RAMP_SECS), RESIZE_SPEED_MAX);
+        assert_eq!(glide_speed(10.0), RESIZE_SPEED_MAX);
+        assert!(glide_speed(0.2) < glide_speed(0.4));
+
+        let step = RESIZE_STEP.round() as i32;
+        let start = Instant::now();
+
+        // A tap glides exactly one step in a few small frames, then stops.
+        let mut t = start;
+        let mut tap = KeyGlide::new(t);
+        tap.press(None, (-1, 0), t);
+        assert_eq!(run_glide(&mut tap, &mut t, 100, 3), (-step, 0));
+        assert!(tap.is_done());
+
+        // Releasing a key right after pressing it still finishes the step.
+        let key = Keycode::new(116);
+        let mut t = start;
+        let mut quick = KeyGlide::new(t);
+        quick.press(Some(key), (0, 1), t);
+        t += Duration::from_millis(8);
+        let first = quick.advance(t).1;
+        quick.release(key);
+        let rest = run_glide(&mut quick, &mut t, 100, 3).1;
+        assert_eq!(first + rest, step);
+        assert!(quick.is_done());
+
+        // Holding keeps it moving and speeding up, never in big jumps; a repeated press of
+        // the held key does not double the speed. Releasing stops it straight away.
+        let mut t = start;
+        let mut held = KeyGlide::new(t);
+        held.press(Some(key), (1, 0), t);
+        held.press(Some(key), (1, 0), t);
+        let early = run_glide(&mut held, &mut t, 25, 3).0;
+        let late = run_glide(&mut held, &mut t, 100, 13).0;
+        assert!(!held.is_done());
+        assert!(
+            early > step && late > early * 3,
+            "early {early}, late {late}"
+        );
+        held.release(key);
+        t += Duration::from_millis(8);
+        assert!(held.advance(t).0.abs() <= 1);
+        assert!(held.is_done());
+
+        // A stalled frame only credits a short slice of motion.
+        let mut t = start;
+        let mut stalled = KeyGlide::new(t);
+        stalled.press(Some(key), (1, 0), t);
+        t += Duration::from_secs(2);
+        assert!(stalled.advance(t).0 <= (RESIZE_SPEED_MAX * 0.05).ceil() as i32);
     }
 
     #[test]

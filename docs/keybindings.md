@@ -36,7 +36,7 @@ While locked, type your password and press `Enter` to unlock (`BackSpace` delete
 | `Mod + j` / `Mod + k` | Focus next / previous window |
 | `Mod + Shift + Return` | Zoom: swap the focused window with the master (on the master: with the next window) |
 | `Mod + Arrow` | Move the window: swap in the tiled stack, or nudge 40 px when floating |
-| `Mod + Shift + Arrow` | Resize by 40 px (a tiled window stays tiled: its neighbours give way) |
+| `Mod + Shift + Arrow` | Resize: the right / bottom edge glides the way the arrow points while held, speeding up the longer you hold (a tap moves 16 px). A tiled window stays tiled and the split beside it moves instead, so `Right` always pushes the divider right, from the master or the stack |
 | `Mod + Shift + Space` | Toggle floating |
 | `Mod + Shift + f` / `F11` | Toggle fullscreen |
 | `Mod + o` | Toggle 100 % opaque mode (for video, photos) |

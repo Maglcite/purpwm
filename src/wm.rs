@@ -362,8 +362,6 @@ pub struct MfactSplit {
     pub start: f32,
     /// `mfact` change per logical pixel the divider moves right.
     pub per_px: f32,
-    /// `1` if moving the divider right grows the resized window, else `-1`.
-    pub grow: i32,
 }
 
 /// The divider between two neighbours in one tiled column.
@@ -375,8 +373,6 @@ pub struct RowSplit<T> {
     pub lower_h: i32,
     /// Pixels of height per unit of `cfact` in this column.
     pub px_per_cfact: f32,
-    /// `1` if moving the divider down grows the resized window, else `-1`.
-    pub grow: i32,
 }
 
 impl<T> RowSplit<T> {
@@ -411,7 +407,6 @@ impl<T> TiledResize<T> {
                 upper_h: r.upper_h,
                 lower_h: r.lower_h,
                 px_per_cfact: r.px_per_cfact,
-                grow: r.grow,
             }),
         }
     }
@@ -656,7 +651,6 @@ impl Workspace {
             .into_iter()
             .find(|&x| inside(x));
             if let Some(divider) = picked {
-                let grow = if divider == right { 1 } else { -1 };
                 let per_px = if centered_sides {
                     let inner = (usable.size.w - 2 * gap).max(1) as f32;
                     let toward_master = if divider * 2 < usable.loc.x * 2 + usable.size.w {
@@ -671,7 +665,6 @@ impl Workspace {
                 plan.mfact = Some(MfactSplit {
                     start: self.mfact(),
                     per_px,
-                    grow,
                 });
             }
         }
@@ -704,7 +697,6 @@ impl Workspace {
                     upper_h: upper_geo.size.h,
                     lower_h: lower_geo.size.h,
                     px_per_cfact: heights as f32 / weights,
-                    grow: if upper == target { 1 } else { -1 },
                 });
             }
         }

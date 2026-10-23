@@ -7,6 +7,7 @@ pub mod bar;
 pub mod capture;
 pub mod config;
 pub mod cursor;
+pub mod glide;
 pub mod help;
 pub mod input;
 pub mod lock;
@@ -107,7 +108,7 @@ fn print_usage() {
          \x20 Mod + s / Mod + `  Toggle drop-down Scratchpad Terminal\n\
          \x20 Mod + Shift/Ctrl+l Lock screen with built-in PAM screen locker (also kill -USR2)\n\
          \x20 Mod + Arrow Keys   Move focused window (swap in tiled mode, nudge in floating mode)\n\
-         \x20 Mod + Shift+Arrows Resize focused floating window\n\
+         \x20 Mod + Shift+Arrows Resize focused window: hold to glide the edge / tiling split the way the arrow points\n\
          \x20 Mod + j / k        Focus next / previous window\n\
          \x20 Mod + [ / ] (or l) Decrease / increase master width factor (mfact)\n\
          \x20 Mod + i / d        Increase / decrease master window count (nmaster)\n\
@@ -470,6 +471,7 @@ pub fn run_winit(
         display.flush_clients()?;
 
         let status_changed = state.bar.tick_status();
+        let key_resizing = state.tick_key_resize();
         let lock_changed = state.poll_lock_screen();
         let notif_changed = state.notifications.tick();
         let portal_replies = capture_server.poll(state.is_locked());
@@ -483,6 +485,7 @@ pub fn run_winit(
             || notif_changed
             || state.bar.is_dirty()
             || state.active_grab.is_some()
+            || key_resizing
             || state.screenshot_request.is_some()
             || portal_capture
         {

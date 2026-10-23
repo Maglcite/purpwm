@@ -37,8 +37,14 @@ pub const DEFAULT_NMASTER: usize = 1;
 /// Step in pixels when moving a floating window with `Mod + Arrow` keys.
 pub const MOVE_STEP: i32 = 40;
 
-/// Step in pixels when resizing a window with `Mod + Shift + Arrow` keys.
-pub const RESIZE_STEP: i32 = 40;
+/// `Mod + Shift + Arrow` glides the window edge (or the tiling split beside it) the way the
+/// arrow points for as long as the key is held: it starts at `RESIZE_SPEED_MIN` and eases up
+/// to `RESIZE_SPEED_MAX` (logical pixels per second) over `RESIZE_RAMP_SECS`. A quick tap
+/// still glides `RESIZE_STEP` pixels.
+pub const RESIZE_STEP: f64 = 16.0;
+pub const RESIZE_SPEED_MIN: f64 = 240.0;
+pub const RESIZE_SPEED_MAX: f64 = 1400.0;
+pub const RESIZE_RAMP_SECS: f64 = 0.8;
 
 // ============================================================================
 // TRANSLUCENT PURPLE THEME PALETTE
