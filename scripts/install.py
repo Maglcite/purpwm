@@ -105,6 +105,7 @@ def parser():
     p.add_argument("--terminal", help="Terminal executable name/path, or auto")
     p.add_argument("--spotlight", help="Spotlight executable name/path, auto, or none")
     p.add_argument("--font", help="TTF/OTF file path, or auto to use fontconfig")
+    p.add_argument("--wallpaper", help="Wallpaper image path, or none")
     p.add_argument("--scale", type=float, help="Default UI scale, 1.0 through 3.0")
     p.add_argument("--refresh-rate", type=int, help="Standalone refresh rate in Hz (default: 120)")
     p.add_argument("--resolution", help="Standalone resolution: auto or WIDTHxHEIGHT")
@@ -132,7 +133,7 @@ def configure(args):
         "session": "yes" if system else "no", "pam": "yes" if system else "no",
         "keyring_pam": "no",
         "dependencies": ("desktop" if system else "build") if interactive and package_manager() else "none",
-        "terminal": "auto", "spotlight": "auto", "font": "auto", "scale": 1.5,
+        "terminal": "auto", "spotlight": "auto", "font": "auto", "wallpaper": "none", "scale": 1.5,
         "refresh_rate": 120, "resolution": "auto", "autostart": "yes",
     }
     labels = {"prefix": "Install prefix", "session": "Add a login-screen session",
@@ -140,6 +141,7 @@ def configure(args):
               "keyring_pam": "Unlock the keyring at login (edits login PAM, keeps a backup)",
               "dependencies": "Install dependencies", "terminal": "Terminal executable",
               "spotlight": "Spotlight executable (auto/path/none)", "font": "Font file (auto/path)",
+              "wallpaper": "Wallpaper image (path/none)",
               "scale": "Default UI scale (1.0–3.0)", "refresh_rate": "Refresh rate (Hz)",
               "resolution": "Resolution (auto or WIDTHxHEIGHT)", "autostart": "Start session helpers"}
     for key, default in defaults.items():
@@ -149,6 +151,13 @@ def configure(args):
                 choices = ("none", "build", "desktop")
             setattr(args, key, ask(labels[key], default, choices) if interactive else default)
     args.prefix = absolute_path(args.prefix, home)
+    if args.wallpaper != "none":
+        wallpaper = absolute_path(args.wallpaper, home)
+        if not wallpaper.is_file():
+            raise ValueError(f"Wallpaper image not found: {wallpaper}")
+        if wallpaper.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            raise ValueError("Wallpaper must be a PNG, JPEG, WebP, or BMP image.")
+        args.wallpaper = str(wallpaper)
     xdg_config = absolute_path(os.environ.get("XDG_CONFIG_HOME") or home / ".config", home)
     xdg_data = absolute_path(os.environ.get("XDG_DATA_HOME") or home / ".local/share", home)
     defaults = {
@@ -260,9 +269,11 @@ def font_path(value):
 
 
 def session_config(args, terminal, spotlight, font):
+    wallpaper = "" if args.wallpaper == "none" else args.wallpaper
     values = {"PURPWM_DEFAULT_SCALE": str(args.scale), "PURPWM_REFRESH_RATE": str(args.refresh_rate),
               "PURPWM_RESOLUTION": args.resolution, "PURPWM_AUTOSTART": "1" if args.autostart == "yes" else "0",
-              "PURPWM_TERMINAL": terminal, "PURPWM_SPOTLIGHT": spotlight, "PURPWM_FONT": font}
+              "PURPWM_TERMINAL": terminal, "PURPWM_SPOTLIGHT": spotlight, "PURPWM_FONT": font,
+              "PURPWM_WALLPAPER": wallpaper}
     if args.pam == "yes" and args.pam_dir != Path("/etc/pam.d"):
         values["PURPWM_PAM_CONFDIR"] = str(args.pam_dir)
     # Fill unset environment variables; quote paths as data, never shell commands.
@@ -353,7 +364,7 @@ def main(argv=None):
           f"Lock PAM: {args.pam_dir / 'purpwm' if args.pam == 'yes' else 'unchanged'}\n"
           f"Keyring login unlock: {args.keyring_pam}\n"
           f"Scale: {args.scale}; refresh: {args.refresh_rate} Hz; resolution: {args.resolution}\n"
-          f"Terminal: {args.terminal}; Spotlight: {args.spotlight}; font: {args.font}\n"
+          f"Terminal: {args.terminal}; Spotlight: {args.spotlight}; font: {args.font}; wallpaper: {args.wallpaper}\n"
           f"Autostart: {args.autostart}; build: {'reuse binary' if args.no_build else 'release (Cargo.lock)'}")
     for command in commands:
         print("Packages: " + shlex.join(command))

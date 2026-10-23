@@ -25,6 +25,7 @@ can override them. A manually written per-user assignment takes precedence when 
 | `PURPWM_TERMINAL` | Terminal executable name or path, shared by the terminal binding and scratchpad |
 | `PURPWM_SPOTLIGHT` | Spotlight executable name/path; `none` disables daemon startup and toggling |
 | `PURPWM_FONT` | Font file for the bar, help and lock screen |
+| `PURPWM_WALLPAPER` | Optional PNG, JPEG, WebP or BMP image drawn across the desktop behind windows |
 | `PURPWM_DEFAULT_SCALE` | Install default used when no explicit or saved UI scale exists |
 | `PURPWM_REFRESH_RATE` | Standalone refresh rate in Hz, default `120` |
 | `PURPWM_RESOLUTION` | `auto` or a resolution such as `2560x1600` |
@@ -37,7 +38,12 @@ For example, put these assignments in your per-user `session.conf`:
 export PURPWM_TERMINAL='/usr/bin/foot'
 export PURPWM_SPOTLIGHT='/home/your-user/apps/spotlight'
 export PURPWM_REFRESH_RATE=144
+export PURPWM_WALLPAPER='/home/your-user/Pictures/wallpaper.jpg'
 ```
+
+The wallpaper is loaded when purpwm starts and scaled to the current output size. Leave
+`PURPWM_WALLPAPER` unset to use the default purple background. Layer-shell wallpaper
+surfaces remain supported and are drawn above this image.
 
 Executable settings take a single name or path, with no arguments or shell expansion.
 Empty values use the compiled command candidates. Settings are read by `start-purpwm`;

@@ -319,6 +319,9 @@ pub fn render_output_frame<'a>(
             .help
             .render_element(renderer, font, physical_size, scale)
     };
+    let wallpaper_elem = state
+        .wallpaper
+        .render_element(renderer, physical_size.w, physical_size.h);
 
     // 7. Drag-and-drop icon surface (if an active client DnD session provided one)
     let dnd_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
@@ -383,6 +386,10 @@ pub fn render_output_frame<'a>(
 
     // Clear background with deep translucent purple
     frame.clear(COLOR_BG_ROOT, &[damage])?;
+
+    if let Some(ref wallpaper) = wallpaper_elem {
+        draw_render_elements(&mut frame, 1.0, std::slice::from_ref(wallpaper), &[damage])?;
+    }
 
     // Wallpaper / bottom layer-shell surfaces
     draw_render_elements(&mut frame, scale, &below_layer_elems, &[damage])?;

@@ -424,6 +424,7 @@ pub struct PurpState {
     pub lock_screen: Option<LockScreen>,
     pub notifications: NotificationCenter,
     pub help: HelpOverlay,
+    pub wallpaper: crate::wallpaper::Wallpaper,
 }
 
 /// Convert physical window touch coordinates `(phys_x, phys_y)` into logical output coordinates
@@ -544,6 +545,7 @@ impl PurpState {
             lock_screen: None,
             notifications,
             help: HelpOverlay::default(),
+            wallpaper: crate::wallpaper::Wallpaper::from_environment(),
         }
     }
 

@@ -37,7 +37,7 @@ The wizard offers:
 | Lock PAM | Detects the distro auth/account stack; preserves an existing `purpwm` service |
 | Keyring login unlock | Off by default; `yes` adds GNOME Keyring hooks to login PAM (backed up) |
 | Dependencies | `none`, `build`, or `desktop` |
-| Terminal/Spotlight/font | Automatic detection or an executable/font path; Spotlight can be disabled |
+| Terminal/Spotlight/font/wallpaper | Automatic detection or an executable/font/image path; Spotlight and wallpaper can be disabled |
 | Display | Scale `1.0`–`3.0`, native or explicit resolution, refresh rate (default `120` Hz) |
 | Autostart | Whether to start session helpers |
 
@@ -54,6 +54,9 @@ purpwm listed reliably on the login screen.
 
 # Install for your user, without prompts or package changes.
 ./install.sh --user --non-interactive --scale 1.25 --spotlight none
+
+# Install with a custom desktop wallpaper.
+./install.sh --user --non-interactive --wallpaper "$HOME/Pictures/wallpaper.jpg"
 
 # Install for all users, choosing preferences and dependency installation.
 ./install.sh --system --non-interactive --dependencies desktop \

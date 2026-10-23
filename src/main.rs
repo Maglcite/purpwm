@@ -13,6 +13,7 @@ pub mod lock;
 pub mod notify;
 pub mod render;
 pub mod state;
+pub mod wallpaper;
 #[cfg(test)]
 mod tests;
 pub mod wm;

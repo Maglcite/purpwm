@@ -794,6 +794,15 @@ impl PurpState {
             return;
         }
 
+        // A compositor move/resize can miss its release if the pointer leaves the
+        // backend surface. A fresh press cannot be part of that held-button drag;
+        // discard the stale grab so it cannot swallow later client clicks.
+        if state == ButtonState::Pressed && self.active_grab.is_some() {
+            self.active_grab = None;
+            self.touch_grab_slot = None;
+            self.relayout();
+        }
+
         if state == ButtonState::Released && self.touch_grab_slot.is_none() {
             if let Some(grab) = self.active_grab.take() {
                 let forward = grab.forward_release();
