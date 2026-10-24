@@ -36,6 +36,7 @@ use smithay::{
             PointerButtonEvent, PointerMotionEvent, TouchEvent,
         },
         renderer::{
+            damage::OutputDamageTracker,
             gles::{GlesError, GlesMapping, GlesRenderer, GlesTarget},
             ExportMem, Texture,
         },
@@ -328,6 +329,7 @@ pub fn run_winit(
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
+    let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
     let mut state = PurpState::new(dh, socket_name.clone(), initial_logical, !is_standalone);
     state.set_scale(scale);
@@ -380,6 +382,7 @@ pub fn run_winit(
     let start_time = Instant::now();
     let mut last_trim = Instant::now();
     let mut needs_render = true;
+    let mut buffer_age = 0;
 
     while !state.should_quit {
         let mut had_winit_events = false;
@@ -508,20 +511,23 @@ pub fn run_winit(
                 );
                 output.set_preferred(mode);
                 state.output_size = logical_output_size(phys_size, state.scale);
+                state.clamp_floating_windows();
                 state.relayout();
             }
-            let full_damage = Rectangle::from_size(phys_size);
+            let capture_pending = state.screenshot_request.is_some() || portal_capture;
+            let age = if capture_pending { 0 } else { buffer_age };
             let mut pending_capture = None;
             let mut pending_portal_capture = None;
 
-            {
+            let damage = {
                 let (renderer, mut framebuffer) = backend.bind()?;
-                render_output_frame(
+                let damage = render_output_frame(
                     &mut state,
                     renderer,
                     &mut framebuffer,
+                    age,
+                    &mut damage_tracker,
                     phys_size,
-                    Transform::Flipped180,
                 )?;
                 if let Some(request) = state.screenshot_request.take() {
                     match start_capture(renderer, &framebuffer, phys_size, state.scale, request) {
@@ -541,35 +547,42 @@ pub fn run_winit(
                         .map_err(|error| error.to_string()),
                     );
                 }
-            }
+                damage
+            };
 
-            // Only visible surfaces get frame callbacks, so clients on hidden tags (or while
-            // the session is locked) stop redrawing until they are shown again.
-            if !state.is_locked() {
-                let elapsed_ms = start_time.elapsed().as_millis() as u32;
-                let tags = state.workspace.selected_tags;
-                for win in state.windows.iter().filter(|w| w.is_visible_on(tags)) {
-                    send_frames_surface_tree(win.wl_surface(), elapsed_ms);
-                }
-                for (popup, _) in state.visible_popups() {
-                    send_frames_surface_tree(popup.wl_surface(), elapsed_ms);
-                }
-                if let CursorImageStatus::Surface(ref cursor) = state.cursor_status {
-                    send_frames_surface_tree(cursor, elapsed_ms);
-                }
-                for layer in &state.layer_surfaces {
-                    if layer.surface.alive() {
-                        send_frames_surface_tree(layer.surface.wl_surface(), elapsed_ms);
+            if let Some(damage) = damage {
+                // Only visible surfaces get frame callbacks, so clients on hidden tags (or while
+                // the session is locked) stop redrawing until they are shown again.
+                if !state.is_locked() {
+                    let elapsed_ms = start_time.elapsed().as_millis() as u32;
+                    let tags = state.workspace.selected_tags;
+                    for win in state.windows.iter().filter(|w| w.is_visible_on(tags)) {
+                        send_frames_surface_tree(win.wl_surface(), elapsed_ms);
+                    }
+                    for (popup, _) in state.visible_popups() {
+                        send_frames_surface_tree(popup.wl_surface(), elapsed_ms);
+                    }
+                    if let CursorImageStatus::Surface(ref cursor) = state.cursor_status {
+                        send_frames_surface_tree(cursor, elapsed_ms);
+                    }
+                    for layer in &state.layer_surfaces {
+                        if layer.surface.alive()
+                            && layer.is_mapped()
+                            && layer.namespace != "Spotlight-keepalive"
+                        {
+                            send_frames_surface_tree(layer.surface.wl_surface(), elapsed_ms);
+                        }
+                    }
+                    if let Some(ref icon) = state.dnd_icon {
+                        if icon.alive() {
+                            send_frames_surface_tree(icon, elapsed_ms);
+                        }
                     }
                 }
-                if let Some(ref icon) = state.dnd_icon {
-                    if icon.alive() {
-                        send_frames_surface_tree(icon, elapsed_ms);
-                    }
-                }
-            }
 
-            backend.submit(Some(&[full_damage]))?;
+                backend.submit(Some(&damage))?;
+                buffer_age = backend.buffer_age().unwrap_or(0);
+            }
             needs_render = false;
 
             if let Some(mapping) = pending_capture.take() {

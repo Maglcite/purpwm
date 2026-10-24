@@ -16,7 +16,10 @@ use std::{
 use smithay::{
     backend::{
         input::{Keycode, TouchSlot},
-        renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
+        renderer::{
+            element::Id,
+            utils::{on_commit_buffer_handler, with_renderer_surface_state},
+        },
     },
     delegate_compositor, delegate_cursor_shape, delegate_data_control, delegate_data_device,
     delegate_fractional_scale, delegate_idle_inhibit, delegate_layer_shell, delegate_output,
@@ -166,6 +169,39 @@ pub(crate) fn resize_rect(
     Rectangle::new(Point::from((x, y)), Size::from((w, h)))
 }
 
+pub(crate) fn clamp_floating_loc(
+    loc: Point<i32, Logical>,
+    size: Size<i32, Logical>,
+    output_size: Size<i32, Logical>,
+    show_bar: bool,
+) -> Point<i32, Logical> {
+    const VISIBLE_STRIP: i32 = 32;
+    let top = if show_bar { BAR_HEIGHT } else { 0 };
+    let min_x = VISIBLE_STRIP - size.w;
+    let max_x = (output_size.w - VISIBLE_STRIP).max(min_x);
+    Point::from((
+        loc.x.clamp(min_x, max_x),
+        loc.y.clamp(top, (output_size.h - VISIBLE_STRIP).max(top)),
+    ))
+}
+
+pub(crate) fn clamp_floating_geo(
+    geo: Rectangle<i32, Logical>,
+    output_size: Size<i32, Logical>,
+    show_bar: bool,
+) -> Rectangle<i32, Logical> {
+    let top = if show_bar { BAR_HEIGHT } else { 0 };
+    let size = Size::from((
+        geo.size.w.clamp(1, output_size.w.max(1)),
+        geo.size.h.clamp(1, (output_size.h - top).max(1)),
+    ));
+    let loc = Point::from((
+        geo.loc.x.clamp(0, (output_size.w - size.w).max(0)),
+        geo.loc.y.clamp(top, (output_size.h - size.h).max(top)),
+    ));
+    Rectangle::new(loc, size)
+}
+
 /// After swapping the focused window with `target`, which index should stay focused.
 /// Zooming the master focuses the window that moved into the master slot (still at
 /// `focused`). Zooming any other window focuses it in its new master slot (`target`).
@@ -268,6 +304,8 @@ pub struct ManagedLayerSurface {
     pub layer: Layer,
     pub namespace: String,
     pub geo: Rectangle<i32, Logical>,
+    pub border_render_id: Id,
+    pub glow_render_id: Id,
 }
 
 impl ManagedLayerSurface {
@@ -617,7 +655,7 @@ impl PurpState {
                 true
             }
             LockPoll::Failed => true,
-            LockPoll::Pending => false,
+            LockPoll::Pending => lock.needs_clock_redraw(),
         }
     }
 
@@ -929,12 +967,25 @@ impl PurpState {
         self.relayout();
     }
 
+    pub(crate) fn floating_grab_geometry(&mut self, idx: usize) -> Option<Rectangle<i32, Logical>> {
+        let floating_layout = self.workspace.layout() == LayoutMode::Floating;
+        let w = self.windows.get_mut(idx)?;
+        if w.is_fullscreen {
+            return None;
+        }
+        if !floating_layout && !w.is_floating && !w.is_scratchpad {
+            w.is_floating = true;
+            w.float_geo = w.geo;
+        }
+        Some(w.float_geo)
+    }
+
     /// Move the focused window with `Mod + Arrow` keys.
     pub fn move_focused_window(&mut self, dx: i32, dy: i32) {
         let Some(focused) = self.focused_idx else {
             return;
         };
-        if focused >= self.windows.len() {
+        if self.windows.get(focused).is_none_or(|w| w.is_fullscreen) {
             return;
         }
 
@@ -944,8 +995,13 @@ impl PurpState {
 
         if is_float {
             let w = &mut self.windows[focused];
-            w.float_geo.loc.x += dx * MOVE_STEP;
-            w.float_geo.loc.y += dy * MOVE_STEP;
+            let loc = w.float_geo.loc + Point::from((dx * MOVE_STEP, dy * MOVE_STEP));
+            w.float_geo.loc = clamp_floating_loc(
+                loc,
+                w.float_geo.size,
+                self.output_size,
+                self.workspace.show_bar,
+            );
             w.geo = w.float_geo;
             self.relayout();
             return;
@@ -997,7 +1053,7 @@ impl PurpState {
         }
 
         let w = &mut self.windows[idx];
-        if !w.is_floating && !w.is_scratchpad {
+        if self.workspace.layout() != LayoutMode::Floating && !w.is_floating && !w.is_scratchpad {
             w.is_floating = true;
             w.float_geo = w.geo;
         }
@@ -1029,6 +1085,9 @@ impl PurpState {
         let plan = self
             .workspace
             .plan_tiled_resize(self.output_size, &tiled, idx, edges);
+        if plan.is_empty() {
+            return None;
+        }
         Some(plan.map(|i| self.windows[i].wl_surface().clone()))
     }
 
@@ -1155,12 +1214,31 @@ impl PurpState {
         self.relayout();
     }
 
+    pub fn clamp_floating_windows(&mut self) {
+        let floating_layout = self.workspace.layout() == LayoutMode::Floating;
+        for w in &mut self.windows {
+            if w.is_fullscreen || !(floating_layout || w.is_floating || w.is_scratchpad) {
+                continue;
+            }
+            w.float_geo =
+                clamp_floating_geo(w.float_geo, self.output_size, self.workspace.show_bar);
+            w.geo = w.float_geo;
+        }
+    }
+
     /// Top-left corner for a new floating window of `size`: centred below the bar, stepped
-    /// diagonally while another visible floating window already sits there, so floating
-    /// windows never hide each other completely.
-    pub fn cascade_loc(&self, size: Size<i32, Logical>, skip: Option<usize>) -> Point<i32, Logical> {
+    /// diagonally while another visible floating window already sits there.
+    pub fn cascade_loc(
+        &self,
+        size: Size<i32, Logical>,
+        skip: Option<usize>,
+    ) -> Point<i32, Logical> {
         const STEP: i32 = 32;
-        let top = if self.workspace.show_bar { BAR_HEIGHT } else { 0 };
+        let top = if self.workspace.show_bar {
+            BAR_HEIGHT
+        } else {
+            0
+        };
         let out = self.output_size;
         let start = Point::<i32, Logical>::from((
             ((out.w - size.w) / 2).max(0),
@@ -1182,18 +1260,25 @@ impl PurpState {
                 p.y.clamp(top, (out.h - size.h).max(top)),
             ))
         };
-        let mut loc = start;
-        for step in 1..=12 {
-            if !taken(loc) {
-                return clamp(loc);
+        for step in 0..12 {
+            let mut candidate = Point::from((start.x + step * STEP, start.y + step * STEP));
+            if candidate.x + size.w > out.w || candidate.y + size.h > out.h {
+                candidate = Point::from((STEP * step, top + STEP * step));
             }
-            loc = Point::from((start.x + step * STEP, start.y + step * STEP));
-            if loc.x + size.w > out.w || loc.y + size.h > out.h {
-                // Ran off the screen: continue the cascade from the top-left instead.
-                loc = Point::from((STEP * step, top + STEP * step));
+            candidate = clamp(candidate);
+            if !taken(candidate) {
+                return candidate;
             }
         }
-        clamp(loc)
+        for y in (top..out.h.max(top)).step_by(STEP as usize) {
+            for x in (0..out.w.max(0)).step_by(STEP as usize) {
+                let candidate = clamp(Point::from((x, y)));
+                if !taken(candidate) {
+                    return candidate;
+                }
+            }
+        }
+        clamp(start)
     }
 
     /// For self-sizing floating windows, make the frame match what the client actually drew
@@ -1244,6 +1329,9 @@ impl PurpState {
     pub fn toggle_floating_focused(&mut self) {
         if let Some(idx) = self.focused_idx {
             if let Some(w) = self.windows.get_mut(idx) {
+                if w.is_fullscreen {
+                    return;
+                }
                 w.is_floating = !w.is_floating;
                 if w.is_floating {
                     w.float_geo = w.geo;
@@ -1809,13 +1897,11 @@ impl PurpState {
             }
         }
 
-        let w = &mut self.windows[idx];
-        if !w.is_floating && !w.is_scratchpad {
-            w.is_floating = true;
-            w.float_geo = w.geo;
-        }
-        let start_geo = w.float_geo;
-        let wl_surface = w.wl_surface().clone();
+        let Some(start_geo) = self.floating_grab_geometry(idx) else {
+            self.touch_grab_slot = None;
+            return;
+        };
+        let wl_surface = self.windows[idx].wl_surface().clone();
         self.active_grab = Some(if let Some(edge) = edges {
             InteractiveGrab::Resize {
                 surface: wl_surface,
@@ -2264,6 +2350,8 @@ impl WlrLayerShellHandler for PurpState {
                 Point::from(((self.output_size.w - w) / 2, (self.output_size.h - h) / 2)),
                 Size::from((w, h)),
             ),
+            border_render_id: Id::new(),
+            glow_render_id: Id::new(),
         };
         managed.compute_geometry(self.output_size);
         self.layer_surfaces.push(managed);
@@ -2405,16 +2493,21 @@ impl XdgShellHandler for PurpState {
     }
 
     fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+        if self.is_locked() {
+            return;
+        }
         if let Some(idx) = self.windows.iter().position(|w| w.toplevel == surface) {
-            self.windows[idx].is_fullscreen = true;
             if self.windows[idx].is_visible_on(self.workspace.selected_tags) {
-                self.focused_idx = Some(idx);
+                self.windows[idx].is_fullscreen = true;
             }
             self.relayout();
         }
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        if self.is_locked() {
+            return;
+        }
         if let Some(w) = self.windows.iter_mut().find(|w| w.toplevel == surface) {
             w.is_fullscreen = false;
             self.relayout();

@@ -254,6 +254,26 @@ impl NotificationCenter {
         false
     }
 
+    /// Frame-to-frame rasterization cache check. Compares the stored draw keys against
+    /// the live toasts by reference so steady-state frames never clone toast strings;
+    /// owned keys are rebuilt only by [`Self::render_element`] after an actual redraw.
+    fn matches_last_drawn(&self, scale_key: i32) -> bool {
+        match &self.last_drawn {
+            Some((last_scale, keys))
+                if *last_scale == scale_key && keys.len() == self.toasts.len() =>
+            {
+                keys.iter().zip(&self.toasts).all(|(key, toast)| {
+                    key.id == toast.id
+                        && key.app_name == toast.app_name
+                        && key.summary == toast.summary
+                        && key.body == toast.body
+                        && key.urgency == toast.urgency
+                })
+            }
+            _ => false,
+        }
+    }
+
     /// Render the visible notification stack as a single `MemoryRenderBufferRenderElement`.
     pub fn render_element<R>(
         &mut self,
@@ -270,25 +290,26 @@ impl NotificationCenter {
         let stack_geo = self.stack_geometry(output_width_logical, bar_visible)?;
         let phys_rect: Rectangle<i32, Physical> = stack_geo.to_physical_precise_round(scale);
         let scale_key = (scale * 100.0).round() as i32;
-        let draw_keys: Vec<ToastDrawKey> = self
-            .toasts
-            .iter()
-            .map(|t| ToastDrawKey {
-                id: t.id,
-                app_name: t.app_name.clone(),
-                summary: t.summary.clone(),
-                body: t.body.clone(),
-                urgency: t.urgency,
-            })
-            .collect();
 
-        if self.last_drawn.as_ref() != Some(&(scale_key, draw_keys.clone())) {
+        if !self.matches_last_drawn(scale_key) {
             self.redraw(
                 font,
                 phys_rect.size.w.max(1),
                 phys_rect.size.h.max(1),
                 scale,
             );
+            // Clone the draw key only now, when the cached rasterization was invalidated.
+            let draw_keys: Vec<ToastDrawKey> = self
+                .toasts
+                .iter()
+                .map(|t| ToastDrawKey {
+                    id: t.id,
+                    app_name: t.app_name.clone(),
+                    summary: t.summary.clone(),
+                    body: t.body.clone(),
+                    urgency: t.urgency,
+                })
+                .collect();
             self.last_drawn = Some((scale_key, draw_keys));
         }
 
@@ -312,7 +333,7 @@ impl NotificationCenter {
         let border = px(2).max(1);
         let title_px = (BAR_FONT_SIZE + 0.5) * scale as f32;
         let body_px = (BAR_FONT_SIZE - 1.0) * scale as f32;
-        let toasts = self.toasts.clone();
+        let toasts = &self.toasts;
 
         let mut ctx = self.buffer.render();
         ctx.resize((w, h));
@@ -613,5 +634,44 @@ fn draw_clipped_line(
             }
         }
         pen += cw;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn draw_cache_hits_only_when_nothing_changed() {
+        let mut center = NotificationCenter::new();
+        assert!(!center.matches_last_drawn(150));
+
+        center.push(0, "purpwm", "Hello", "Body text", 1, Some(10_000));
+        let id = center.toasts[0].id;
+        center.last_drawn = Some((
+            150,
+            vec![ToastDrawKey {
+                id,
+                app_name: "purpwm".to_string(),
+                summary: "Hello".to_string(),
+                body: "Body text".to_string(),
+                urgency: 1,
+            }],
+        ));
+
+        assert!(center.matches_last_drawn(150));
+        assert!(!center.matches_last_drawn(151), "scale change must redraw");
+
+        center.toasts[0].summary = "Changed".to_string();
+        assert!(
+            !center.matches_last_drawn(150),
+            "content change must redraw"
+        );
+
+        center.push(0, "purpwm", "Second", "Other body", 1, Some(10_000));
+        assert!(
+            !center.matches_last_drawn(150),
+            "toast count change must redraw"
+        );
     }
 }

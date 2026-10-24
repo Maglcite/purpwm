@@ -21,12 +21,12 @@ mod tests {
         lock::{pam_check, LockKey, LockPoll, LockScreen, CONVERSATIONS},
         notify::{parse_dbus_line, parse_dbus_notification_line, DbusLine, NotificationCenter},
         state::{
-            focus_after_zoom, resize_rect, touch_physical_to_logical_coords, wifi_needs_autoconnect,
-            PurpState, ResizeEdges,
+            clamp_floating_geo, clamp_floating_loc, focus_after_zoom, resize_rect,
+            touch_physical_to_logical_coords, wifi_needs_autoconnect, PurpState, ResizeEdges,
         },
         wm::{
-            centered_side_widths, master_stack_widths, scratchpad_geo, split_lengths,
-            split_weighted, LayoutMode, Workspace,
+            centered_side_widths, floating_layout_geo, master_stack_widths, scratchpad_geo,
+            split_lengths, split_weighted, LayoutMode, Workspace,
         },
     };
 
@@ -319,6 +319,35 @@ mod tests {
     }
 
     #[test]
+    fn test_floating_layout_only_restores_actual_floats() {
+        let tiled = Rectangle::new(Point::from((12, 40)), Size::from((700, 800)));
+        let saved = Rectangle::new(Point::from((120, 90)), Size::from((500, 400)));
+        assert_eq!(floating_layout_geo(tiled, saved, false, false), tiled);
+        assert_eq!(floating_layout_geo(tiled, saved, true, false), saved);
+        assert_eq!(floating_layout_geo(tiled, saved, false, true), saved);
+    }
+
+    #[test]
+    fn test_floating_windows_stay_recoverable_and_fit_resized_outputs() {
+        let output = Size::from((800, 600));
+        let size = Size::from((200, 100));
+        let top_left = clamp_floating_loc(Point::from((-1000, -1000)), size, output, true);
+        assert_eq!(top_left, Point::from((32 - size.w, BAR_HEIGHT)));
+        let bottom_right = clamp_floating_loc(Point::from((1000, 1000)), size, output, true);
+        assert_eq!(bottom_right, Point::from((output.w - 32, output.h - 32)));
+
+        let resized = clamp_floating_geo(
+            Rectangle::new(Point::from((500, 500)), Size::from((1200, 900))),
+            output,
+            true,
+        );
+        assert_eq!(resized.size, Size::from((output.w, output.h - BAR_HEIGHT)));
+        assert_eq!(resized.loc, Point::from((0, BAR_HEIGHT)));
+        assert!(resized.loc.x + resized.size.w <= output.w);
+        assert!(resized.loc.y + resized.size.h <= output.h);
+    }
+
+    #[test]
     fn test_layout_splits_fit_the_usable_rect() {
         let columns = split_lengths(100, 3, 6);
         assert_eq!(columns.span(), 100);
@@ -342,6 +371,14 @@ mod tests {
         let font = fontdue::Font::from_bytes(BUNDLED_FONT, fontdue::FontSettings::default())
             .expect("bundled font parses");
         let (metrics, bitmap) = font.rasterize('A', 16.0);
+        assert!(metrics.width > 0 && bitmap.iter().any(|&a| a > 0));
+    }
+
+    #[test]
+    fn test_status_bar_always_loads_a_usable_font() {
+        let bar = StatusBar::new(800);
+        let font = bar.font().expect("status bar must always have a font");
+        let (metrics, bitmap) = font.rasterize('1', 16.0);
         assert!(metrics.width > 0 && bitmap.iter().any(|&a| a > 0));
     }
 
@@ -451,7 +488,11 @@ mod tests {
 
         ws.set_layout(LayoutMode::Monocle);
         let monocle = ws.plan_tiled_resize(output, &tiled, 0, edges(false, false, true, true));
-        assert!(monocle.mfact.is_none() && monocle.rows.is_none());
+        assert!(monocle.is_empty());
+
+        ws.set_layout(LayoutMode::Tile);
+        let no_edges = ws.plan_tiled_resize(output, &tiled, 0, edges(false, false, false, false));
+        assert!(no_edges.is_empty());
     }
 
     /// Sum the motion of `glide` over 8 ms frames from `t` until it finishes or `frames` run

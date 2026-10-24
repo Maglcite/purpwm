@@ -2,12 +2,16 @@
 //! per-tag layout persistence (`pertag`), scratchpads, and window metadata.
 
 use smithay::{
+    backend::renderer::{
+        element::Id,
+        utils::{with_renderer_surface_state, CommitCounter},
+        Color32F,
+    },
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{Logical, Point, Rectangle, Size},
-    backend::renderer::utils::with_renderer_surface_state,
     wayland::{
         compositor::with_states,
         shell::xdg::{SurfaceCachedState, ToplevelSurface},
@@ -91,6 +95,11 @@ pub struct ManagedWindow {
     /// Height weight inside its tiled column (`dwm` `cfacts`); resizing a tiled
     /// window moves the split between it and its neighbour by changing these.
     pub cfact: f32,
+    pub border_render_id: Id,
+    pub glow_render_id: Id,
+    pub backdrop_render_id: Id,
+    pub border_commit: CommitCounter,
+    pub border_color: Option<Color32F>,
 }
 
 impl ManagedWindow {
@@ -117,6 +126,11 @@ impl ManagedWindow {
             client_sized_once: false,
             rule_seen: (String::new(), String::new()),
             cfact: 1.0,
+            border_render_id: Id::new(),
+            glow_render_id: Id::new(),
+            backdrop_render_id: Id::new(),
+            border_commit: CommitCounter::default(),
+            border_color: None,
         }
     }
 
@@ -282,6 +296,19 @@ pub struct TagState {
     pub nmaster: usize,
 }
 
+pub(crate) fn floating_layout_geo(
+    geo: Rectangle<i32, Logical>,
+    float_geo: Rectangle<i32, Logical>,
+    is_floating: bool,
+    is_scratchpad: bool,
+) -> Rectangle<i32, Logical> {
+    if is_floating || is_scratchpad {
+        float_geo
+    } else {
+        geo
+    }
+}
+
 /// Parts of `total` separated by `gap`, summing (with the gaps) back to `total`.
 /// Gaps shrink when they would otherwise push the parts past `total`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +425,10 @@ pub struct TiledResize<T> {
 }
 
 impl<T> TiledResize<T> {
+    pub fn is_empty(&self) -> bool {
+        self.mfact.is_none() && self.rows.is_none()
+    }
+
     pub fn map<U>(self, mut f: impl FnMut(T) -> U) -> TiledResize<U> {
         TiledResize {
             mfact: self.mfact,
@@ -723,7 +754,9 @@ impl Workspace {
             LayoutMode::Floating => {
                 for w in windows.iter_mut() {
                     if w.is_visible_on(self.selected_tags) && !w.is_fullscreen {
-                        w.geo = w.float_geo;
+                        w.geo =
+                            floating_layout_geo(w.geo, w.float_geo, w.is_floating, w.is_scratchpad);
+                        w.float_geo = w.geo;
                     }
                 }
             }

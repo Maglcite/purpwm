@@ -31,6 +31,14 @@ env -u PURPWM_STANDALONE ./target/release/purpwm --no-autostart
 
 ## Common problems
 
+**The bar shows boxes but no text**
+Rebuild and reinstall from the current source, then log in again. Older builds silently drew
+no text when none of their hard-coded font paths existed. Current builds try `PURPWM_FONT`,
+the configured font paths, fontconfig's monospace font, and finally the bundled DejaVu Sans
+Mono. Startup logs either `Loaded status bar font: ...` or `using the bundled DejaVu Sans
+Mono`; an old `No TTF font found in FONT_PATHS` message confirms a stale binary. Using
+`--no-build` reinstalls the supplied binary unchanged, so do not use it with an old build.
+
 **Everything is too small / too big**
 Use `Mod + Ctrl + =` / `Mod + Ctrl + -`; the value is saved in `~/.config/purpwm/scale`.
 Delete that file to go back to `DEFAULT_SCALE`.

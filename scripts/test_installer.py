@@ -210,7 +210,7 @@ class InstallerTests(unittest.TestCase):
     def test_wizard_collects_options_without_writes(self):
         args = setup.parser().parse_args(["--dry-run"])
         answers = iter(["user", str(self.prefix), "no", "no", "no", "none", str(self.stub), "none", "auto",
-                        "1.25", "144", "auto", "no", str(self.prefix / "bin"), str(self.config),
+                        "none", "1.25", "144", "auto", "no", str(self.prefix / "bin"), str(self.config),
                         str(self.root / "sessions")])
         with patch.object(sys.stdin, "isatty", return_value=True), patch("builtins.input", side_effect=lambda _: next(answers)):
             with contextlib.redirect_stdout(io.StringIO()):

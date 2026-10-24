@@ -143,6 +143,13 @@ impl LockScreen {
         self.checking
     }
 
+    pub fn needs_clock_redraw(&self) -> bool {
+        let clock = StatusBar::format_local_time();
+        self.drawn
+            .as_ref()
+            .is_some_and(|drawn| drawn.clock != clock)
+    }
+
     pub fn password_len(&self) -> usize {
         self.password.chars().count()
     }

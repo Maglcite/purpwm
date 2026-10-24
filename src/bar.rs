@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     fs,
     process::{Command, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -67,6 +67,13 @@ struct SystemStatusSnapshot {
     sys_metrics: String,
 }
 
+/// Coalesced one-shot immediate-refresh request handed to the background status thread;
+/// at most one refresh is ever pending, so requests never pile up worker threads.
+#[derive(Default)]
+struct StatusRefreshRequest {
+    pending: Option<Instant>,
+}
+
 /// Everything the bar draws besides the status snapshot; a redraw happens only when this changes.
 #[derive(Clone, PartialEq)]
 struct BarInputs {
@@ -101,6 +108,7 @@ pub struct StatusBar {
     dirty: bool,
     last_status_check: Instant,
     shared_status: Arc<Mutex<SystemStatusSnapshot>>,
+    status_request: Arc<(Mutex<StatusRefreshRequest>, Condvar)>,
     current_status: SystemStatusSnapshot,
     last_inputs: Option<BarInputs>,
     tag_cell_width: i32,
@@ -116,7 +124,7 @@ impl StatusBar {
     pub fn new(initial_width: i32) -> Self {
         let width = initial_width.max(320);
         let height = BAR_HEIGHT;
-        let font = Self::load_system_font();
+        let font = Some(Self::load_font());
         let glyph_cache = HashMap::with_capacity(128);
 
         let buffer = MemoryRenderBuffer::new(
@@ -139,15 +147,28 @@ impl StatusBar {
             sys_metrics: Self::collect_fast_metrics(),
         };
         let shared_status = Arc::new(Mutex::new(initial_snapshot.clone()));
+        let status_request =
+            Arc::new((Mutex::new(StatusRefreshRequest::default()), Condvar::new()));
 
         // Background thread: battery, CPU, memory, volume and clock every 2 seconds; the
         // radios (nmcli / bluetoothctl subprocesses) every 6 seconds. Never blocks the frame loop.
         let bg_shared = Arc::clone(&shared_status);
+        let bg_request = Arc::clone(&status_request);
         std::thread::spawn(move || {
             let mut tick = 0u64;
+            let mut next_regular = Instant::now();
             loop {
+                // Service at most one pending immediate refresh per pass; requests that
+                // arrived while one was pending were coalesced into it by the caller.
+                let immediate = {
+                    let mut request = bg_request.0.lock().unwrap_or_else(|e| e.into_inner());
+                    request.pending.take_if(|at| *at <= Instant::now())
+                };
+
+                // Start from the latest shared snapshot so fields refreshed more recently
+                // by the other polling path are never overwritten with stale values.
                 let mut snap = bg_shared.lock().map(|g| g.clone()).unwrap_or_default();
-                if tick.is_multiple_of(3) {
+                if immediate.is_some() || tick.is_multiple_of(3) {
                     Self::refresh_radios(&mut snap);
                 }
                 Self::refresh_fast(&mut snap);
@@ -155,7 +176,32 @@ impl StatusBar {
                     *guard = snap;
                 }
                 tick = tick.wrapping_add(1);
-                std::thread::sleep(Duration::from_secs(2));
+
+                next_regular += Duration::from_secs(2);
+                if next_regular <= Instant::now() {
+                    next_regular = Instant::now() + Duration::from_secs(2);
+                }
+
+                // Sleep until the next regular poll, waking early as soon as an immediate
+                // refresh's debounce has elapsed.
+                let mut request = bg_request.0.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    let now = Instant::now();
+                    if request.pending.is_some_and(|at| at <= now) || now >= next_regular {
+                        break;
+                    }
+                    let wake_at = request
+                        .pending
+                        .map_or(next_regular, |at| at.min(next_regular));
+                    let wait = wake_at.saturating_duration_since(now);
+                    if wait.is_zero() {
+                        break;
+                    }
+                    match bg_request.1.wait_timeout(request, wait) {
+                        Ok((guard, _)) => request = guard,
+                        Err(err) => request = err.into_inner().0,
+                    }
+                }
             }
         });
 
@@ -171,6 +217,7 @@ impl StatusBar {
             dirty: true,
             last_status_check: Instant::now() - Duration::from_secs(10),
             shared_status,
+            status_request,
             current_status: initial_snapshot,
             last_inputs: None,
             tag_cell_width: 34,
@@ -289,7 +336,7 @@ impl StatusBar {
         .ok()
     }
 
-    fn load_system_font() -> Option<Font> {
+    fn load_font() -> Font {
         let load = |path: &str| {
             let bytes = fs::read(path).ok()?;
             match Font::from_bytes(bytes, FontSettings::default()) {
@@ -316,6 +363,7 @@ impl StatusBar {
                 tracing::warn!("No system font usable; using the bundled DejaVu Sans Mono");
                 Font::from_bytes(BUNDLED_FONT, FontSettings::default()).ok()
             })
+            .expect("bundled DejaVu Sans Mono must be a valid font")
     }
 
     /// The loaded status bar font (shared with the lock screen).
@@ -332,17 +380,22 @@ impl StatusBar {
     }
 
     /// Trigger an immediate asynchronous refresh of the Wi-Fi, Bluetooth & volume pills.
-    pub fn request_immediate_status_refresh(&mut self) {
-        let bg_shared = Arc::clone(&self.shared_status);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(350));
-            let mut snap = SystemStatusSnapshot::default();
-            Self::refresh_radios(&mut snap);
-            Self::refresh_fast(&mut snap);
-            if let Ok(mut guard) = bg_shared.lock() {
-                *guard = snap;
-            }
-        });
+    ///
+    /// Single-flight: while a refresh is already pending, further calls are coalesced into
+    /// it instead of each spawning a delayed thread. Returns `true` when this call armed
+    /// the pending refresh.
+    pub fn request_immediate_status_refresh(&mut self) -> bool {
+        let mut request = self
+            .status_request
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if request.pending.is_some() {
+            return false;
+        }
+        request.pending = Some(Instant::now() + Duration::from_millis(350));
+        self.status_request.1.notify_one();
+        true
     }
 
     /// Check if the background status thread produced a new snapshot.
@@ -577,10 +630,9 @@ impl StatusBar {
             self.dirty = true;
         }
 
-        self.tick_status();
-
         // Client commits trigger frames constantly (video, animations); only re-rasterize
-        // the bar when something it shows actually changed.
+        // the bar when something it shows actually changed. Status snapshots are synced
+        // by the main loop's `tick_status` call before rendering.
         let inputs = BarInputs {
             selected_tags,
             occupied_tags,
@@ -1265,5 +1317,34 @@ fn draw_text(
             }
             pen_x += metrics.advance_width.ceil() as i32;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn immediate_refresh_is_single_flight() {
+        let mut bar = StatusBar::new(800);
+        assert!(bar.request_immediate_status_refresh());
+        // A second call while one refresh is pending is coalesced, not re-armed.
+        assert!(!bar.request_immediate_status_refresh());
+        let pending = bar
+            .status_request
+            .0
+            .lock()
+            .map(|request| request.pending)
+            .expect("request lock");
+        assert!(pending.is_some());
+    }
+
+    #[test]
+    fn immediate_refresh_rearms_once_the_pending_one_is_gone() {
+        let mut bar = StatusBar::new(800);
+        assert!(bar.request_immediate_status_refresh());
+        // Simulate the status thread consuming the pending refresh.
+        bar.status_request.0.lock().expect("request lock").pending = None;
+        assert!(bar.request_immediate_status_refresh());
     }
 }

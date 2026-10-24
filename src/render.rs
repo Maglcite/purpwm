@@ -1,21 +1,11 @@
-//! OpenGL ES (`GlesRenderer`) frame composition for `purpwm`:
-//! 1. If the session is locked (`state.lock_screen`), renders only the full-screen purple PAM
-//!    lock screen so no window, bar, or notification is visible while locked
-//! 2. Otherwise clears output with translucent deep purple backdrop (`COLOR_BG_ROOT`)
-//! 3. Renders visible windows with active (`0.94`), inactive (`0.84`), or custom per-window (`1.0`) opacity
-//! 4. Draws 2px glowing electric purple borders (`COLOR_BORDER_ACTIVE` + 1px outer `COLOR_BORDER_GLOW`)
-//! 5. Renders built-in translucent purple top status bar (`MemoryRenderBufferRenderElement`),
-//!    hidden while the focused window is fullscreen
-//! 6. Renders popup menus above windows and the bar
-//! 7. Renders `wlr-layer-shell` surfaces: `Background`/`Bottom` under the windows, `Top`/`Overlay`
-//!    (such as Spotlight) on top
-//! 8. Renders active desktop notification toasts (`NotificationCenter`) in the top-right corner
-//! 9. Renders the `Mod + h` keybinding cheat sheet overlay (`HelpOverlay`) when visible
-//! 10. Renders any active Wayland drag-and-drop icon (`state.dnd_icon`) and the cursor
-//!     (client cursor surface, else the system XCursor theme, else a built-in purple arrow)
+//! Damage-tracked OpenGL ES composition for `purpwm`.
+//!
+//! The element list is front-to-back. Locking replaces the entire desktop list
+//! with the opaque lock screen; screenshots force a full redraw in the caller.
 
 use smithay::{
     backend::renderer::{
+        damage::{Error as DamageError, OutputDamageTracker},
         element::{
             memory::MemoryRenderBufferRenderElement,
             solid::SolidColorRenderElement,
@@ -24,11 +14,11 @@ use smithay::{
             Id, Kind,
         },
         gles::{GlesError, GlesRenderer, GlesTarget},
-        utils::{draw_render_elements, CommitCounter},
-        Color32F, Frame, Renderer,
+        utils::CommitCounter,
+        Color32F,
     },
     input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
-    utils::{IsAlive, Logical, Physical, Point, Rectangle, Size, Transform},
+    utils::{IsAlive, Logical, Physical, Point, Rectangle, Size},
     wayland::compositor::with_states,
 };
 
@@ -40,23 +30,30 @@ use crate::{
     state::PurpState,
 };
 
-/// One window: opaque backdrop (fullscreen only), surfaces clipped to the window, border, glow.
-type WindowRenderBatch = (
-    Option<SolidColorRenderElement>,
-    Vec<CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
-    Option<[SolidColorRenderElement; 4]>,
-    Option<[SolidColorRenderElement; 4]>,
-);
+smithay::backend::renderer::element::render_elements! {
+    pub PurpRenderElement<=GlesRenderer>;
+    Solid=SolidColorRenderElement,
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
+    Crop=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
+}
 
-type LayerRenderBatch = (
-    Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
-    [SolidColorRenderElement; 4],
-    [SolidColorRenderElement; 4],
-);
+fn surface_elements(
+    renderer: &mut GlesRenderer,
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    loc: Point<i32, Physical>,
+    scale: f64,
+    alpha: f32,
+    kind: Kind,
+) -> Vec<WaylandSurfaceRenderElement<GlesRenderer>> {
+    render_elements_from_surface_tree::<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>(
+        renderer, surface, loc, scale, alpha, kind,
+    )
+}
 
-/// Build the 4 rectangular border strips (`Top`, `Bottom`, `Left`, `Right`) around the
-/// logical `geo`, `bw` logical pixels thick, converted to physical pixels at `scale`.
 fn border_rects_for_window(
+    id: &Id,
+    commit: CommitCounter,
     geo: Rectangle<i32, Logical>,
     bw: i32,
     color: Color32F,
@@ -79,18 +76,12 @@ fn border_rects_for_window(
     );
 
     [top, bottom, left, right].map(|rect| {
-        SolidColorRenderElement::new(
-            Id::new(),
-            rect,
-            CommitCounter::default(),
-            color,
-            Kind::Unspecified,
-        )
+        SolidColorRenderElement::new(id.clone(), rect, commit, color, Kind::Unspecified)
     })
 }
 
-/// Build an outer 1px soft amethyst glow halo around `geo` for the focused window.
 fn outer_glow_rects_for_window(
+    id: &Id,
     geo: Rectangle<i32, Logical>,
     scale: f64,
 ) -> [SolidColorRenderElement; 4] {
@@ -98,254 +89,39 @@ fn outer_glow_rects_for_window(
         Point::from((geo.loc.x - 1, geo.loc.y - 1)),
         Size::from((geo.size.w + 2, geo.size.h + 2)),
     );
-    border_rects_for_window(expanded, 1, COLOR_BORDER_GLOW, scale)
+    border_rects_for_window(
+        id,
+        CommitCounter::default(),
+        expanded,
+        1,
+        COLOR_BORDER_GLOW,
+        scale,
+    )
 }
 
-/// Render a complete compositor frame onto `framebuffer`.
-pub fn render_output_frame<'a>(
+pub fn render_output_frame(
     state: &mut PurpState,
     renderer: &mut GlesRenderer,
-    framebuffer: &mut GlesTarget<'a>,
+    framebuffer: &mut GlesTarget<'_>,
+    age: usize,
+    tracker: &mut OutputDamageTracker,
     physical_size: Size<i32, Physical>,
-    transform: Transform,
-) -> Result<(), GlesError> {
-    let damage = Rectangle::from_size(physical_size);
+) -> Result<Option<Vec<Rectangle<i32, Physical>>>, DamageError<GlesError>> {
     let scale = state.scale;
 
-    // 0. If locked, draw only the full-screen purple PAM lock screen (never expose desktop contents).
     if let Some(ref mut lock) = state.lock_screen {
         let font = state.bar.font();
-        let lock_elem = lock.render_element(renderer, font, physical_size, scale);
-        let mut frame = renderer.render(framebuffer, physical_size, transform)?;
-        frame.clear(COLOR_BG_ROOT, &[damage])?;
-        if let Some(ref elem) = lock_elem {
-            draw_render_elements(&mut frame, 1.0, std::slice::from_ref(elem), &[damage])?;
-        }
-        let _ = frame.finish()?;
-        return Ok(());
-    }
-
-    // 1. Prepare the status bar element
-    let occupied_tags = state
-        .windows
-        .iter()
-        .filter(|w| !w.is_scratchpad)
-        .fold(0u16, |acc, w| acc | w.tags);
-    let urgent_tags = state
-        .windows
-        .iter()
-        .filter(|w| w.is_urgent)
-        .fold(0u16, |acc, w| acc | w.tags);
-    let focused_tags = state
-        .focused_idx
-        .and_then(|idx| state.windows.get(idx))
-        .map(|w| w.tags)
-        .unwrap_or(0);
-    let focused_title = state
-        .focused_idx
-        .and_then(|idx| state.windows.get(idx))
-        .filter(|w| w.is_visible_on(state.workspace.selected_tags))
-        .map(|w| {
-            if w.is_scratchpad {
-                format!("[scratch] {}", w.title())
-            } else if w.opacity_override == Some(1.0) {
-                format!("[opaque] {}", w.title())
-            } else {
-                w.title()
-            }
-        })
-        .unwrap_or_else(|| {
-            String::from(
-                "purpwm — Mod+h: Help | Tap Mod: Spotlight | Mod+Enter: Term | Mod+w: Wi-Fi | Mod+Shift+b: BT",
-            )
-        });
-
-    let bar_visible = state.bar_visible();
-    let bar_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> = if bar_visible {
-        state.bar.render_element(
-            renderer,
-            physical_size.w,
-            state.workspace.selected_tags,
-            occupied_tags,
-            focused_tags,
-            urgent_tags,
-            state.workspace.layout(),
-            &focused_title,
-        )
-    } else {
-        None
-    };
-
-    // 2. Collect visible window surface elements & their 2px purple borders + 1px outer glow,
-    //    topmost first (same order the pointer hit-testing uses).
-    let ordered_indices = state.stacking_order();
-
-    let mut window_batches: Vec<WindowRenderBatch> = Vec::with_capacity(ordered_indices.len());
-
-    for idx in ordered_indices {
-        let w = &state.windows[idx];
-        let is_focused = state.focused_idx == Some(idx);
-        // Fullscreen windows (games, video) are always fully opaque: nothing behind them
-        // may show through.
-        let alpha = if w.is_fullscreen {
-            1.0
-        } else {
-            w.opacity_override.unwrap_or(if is_focused {
-                OPACITY_ACTIVE
-            } else {
-                OPACITY_INACTIVE
-            })
-        };
-        let loc_phys = w.surface_loc().to_physical_precise_round(scale);
-
-        // Clip the client to its own window: an oversized or mispositioned buffer must not
-        // spill over other windows or the desktop.
-        let clip: Rectangle<i32, Physical> =
-            Rectangle::new(w.content_loc(), w.surface_size()).to_physical_precise_round(scale);
-        let surf_elems: Vec<CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>> =
-            render_elements_from_surface_tree(
-                renderer,
-                w.wl_surface(),
-                loc_phys,
-                scale,
-                alpha,
-                Kind::Unspecified,
-            )
-            .into_iter()
-            .filter_map(|elem| CropRenderElement::from_element(elem, scale, clip))
-            .collect();
-
-        // Black backdrop behind fullscreen windows, so transparent pixels a game leaves in its
-        // buffer show black instead of the desktop and other windows.
-        let backdrop = w.is_fullscreen.then(|| {
-            SolidColorRenderElement::new(
-                Id::new(),
-                clip,
-                CommitCounter::default(),
-                Color32F::new(0.0, 0.0, 0.0, 1.0),
-                Kind::Unspecified,
-            )
-        });
-
-        let (borders, glow) = if !w.is_fullscreen && BORDER_WIDTH > 0 {
-            let color = if is_focused {
-                COLOR_BORDER_ACTIVE
-            } else {
-                COLOR_BORDER_INACTIVE
-            };
-            let glow_opt = if is_focused {
-                Some(outer_glow_rects_for_window(w.geo, scale))
-            } else {
-                None
-            };
-            (
-                Some(border_rects_for_window(w.geo, BORDER_WIDTH, color, scale)),
-                glow_opt,
-            )
-        } else {
-            (None, None)
-        };
-
-        window_batches.push((backdrop, surf_elems, borders, glow));
-    }
-
-    // 3. Popup menus of visible windows, drawn above all windows (front-to-back like all
-    //    element lists here: topmost first).
-    let popup_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
-        .visible_popups()
-        .into_iter()
-        .flat_map(|(popup, loc)| {
-            render_elements_from_surface_tree(
-                renderer,
-                popup.wl_surface(),
-                loc.to_physical_precise_round(scale),
-                scale,
-                1.0,
-                Kind::Unspecified,
-            )
-        })
-        .collect();
-
-    // 4. `wlr-layer-shell` surfaces: `Background`/`Bottom` (wallpapers) go under the windows,
-    //    `Top`/`Overlay` (e.g. the `Spotlight` launcher) above them with a glowing border.
-    let mut below_layer_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-    let mut layer_batches: Vec<LayerRenderBatch> = Vec::with_capacity(state.layer_surfaces.len());
-
-    for layer in &state.layer_surfaces {
-        if !layer.surface.alive() || layer.namespace == "Spotlight-keepalive" {
-            continue;
-        }
-        let loc_phys = layer.geo.loc.to_physical_precise_round(scale);
-        let alpha = if layer.is_above_windows() {
-            OPACITY_ACTIVE
-        } else {
-            1.0
-        };
-        let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
-            render_elements_from_surface_tree(
-                renderer,
-                layer.surface.wl_surface(),
-                loc_phys,
-                scale,
-                alpha,
-                Kind::Unspecified,
-            );
-        if elems.is_empty() {
-            continue;
-        }
-        if layer.is_above_windows() {
-            let border =
-                border_rects_for_window(layer.geo, BORDER_WIDTH, COLOR_BORDER_ACTIVE, scale);
-            let glow = outer_glow_rects_for_window(layer.geo, scale);
-            layer_batches.push((elems, border, glow));
-        } else {
-            // Later layers sit on top, so they go to the front of the list.
-            below_layer_elems.splice(0..0, elems);
-        }
-    }
-
-    // 5. Notification toasts in the top-right corner
-    let notif_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> = {
-        let font = state.bar.font();
-        state
-            .notifications
-            .render_element(renderer, font, state.output_size.w, bar_visible, scale)
-    };
-
-    // 6. Centred keybinding cheat sheet overlay (`Mod + h`)
-    let help_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> = {
-        let font = state.bar.font();
-        state
-            .help
+        let elements: Vec<PurpRenderElement> = lock
             .render_element(renderer, font, physical_size, scale)
-    };
-    let wallpaper_elem = state
-        .wallpaper
-        .render_element(renderer, physical_size.w, physical_size.h);
+            .into_iter()
+            .map(PurpRenderElement::from)
+            .collect();
+        let result = tracker.render_output(renderer, framebuffer, age, &elements, COLOR_BG_ROOT)?;
+        return Ok(result.damage.cloned());
+    }
 
-    // 7. Drag-and-drop icon surface (if an active client DnD session provided one)
-    let dnd_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
-        .dnd_icon
-        .as_ref()
-        .filter(|s| s.alive())
-        .map(|icon| {
-            let loc_phys = state.pointer_location.to_physical_precise_round(scale);
-            render_elements_from_surface_tree(
-                renderer,
-                icon,
-                loc_phys,
-                scale,
-                0.92,
-                Kind::Unspecified,
-            )
-        })
-        .unwrap_or_default();
+    let mut elements = Vec::new();
 
-    // 8. Pointer cursor (not in screenshots): a client's own cursor surface, else the named
-    //    shape from the system cursor theme, else the built-in purple arrow.
-    let mut cursor_surface_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-    let mut cursor_theme_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> = None;
-    let mut cursor_fallback_elem: Option<MemoryRenderBufferRenderElement<GlesRenderer>> = None;
     if state.screenshot_request.is_none() {
         match state.cursor_status.clone() {
             CursorImageStatus::Hidden => {}
@@ -357,14 +133,12 @@ pub fn render_output_frame<'a>(
                         .map(|data| data.lock().unwrap().hotspot)
                         .unwrap_or_default()
                 });
-                let loc = (state.pointer_location - hotspot.to_f64()).to_physical_precise_round(scale);
-                cursor_surface_elems = render_elements_from_surface_tree(
-                    renderer,
-                    &surface,
-                    loc,
-                    scale,
-                    1.0,
-                    Kind::Cursor,
+                let loc =
+                    (state.pointer_location - hotspot.to_f64()).to_physical_precise_round(scale);
+                elements.extend(
+                    surface_elements(renderer, &surface, loc, scale, 1.0, Kind::Cursor)
+                        .into_iter()
+                        .map(PurpRenderElement::from),
                 );
             }
             status => {
@@ -373,105 +147,258 @@ pub fn render_output_frame<'a>(
                     _ => CursorIcon::Default,
                 };
                 let cpos = state.pointer_location.to_physical(scale);
-                cursor_theme_elem = state.cursor_theme.render_element(renderer, icon, cpos, scale);
-                if cursor_theme_elem.is_none() {
-                    cursor_fallback_elem = state.bar.cursor_render_element(renderer, cpos);
+                if let Some(cursor) = state
+                    .cursor_theme
+                    .render_element(renderer, icon, cpos, scale)
+                {
+                    elements.push(cursor.into());
+                } else if let Some(cursor) = state.bar.cursor_render_element(renderer, cpos) {
+                    elements.push(cursor.into());
                 }
             }
         }
     }
 
-    // 9. Begin OpenGL ES frame & draw
-    let mut frame = renderer.render(framebuffer, physical_size, transform)?;
-
-    // Clear background with deep translucent purple
-    frame.clear(COLOR_BG_ROOT, &[damage])?;
-
-    if let Some(ref wallpaper) = wallpaper_elem {
-        draw_render_elements(&mut frame, 1.0, std::slice::from_ref(wallpaper), &[damage])?;
+    if let Some(icon) = state.dnd_icon.as_ref().filter(|s| s.alive()) {
+        let loc = state.pointer_location.to_physical_precise_round(scale);
+        elements.extend(
+            surface_elements(renderer, icon, loc, scale, 0.92, Kind::Unspecified)
+                .into_iter()
+                .map(PurpRenderElement::from),
+        );
     }
 
-    // Wallpaper / bottom layer-shell surfaces
-    draw_render_elements(&mut frame, scale, &below_layer_elems, &[damage])?;
-
-    // Draw windows from back to front so alpha blending layers properly over the purple backdrop
-    for (maybe_backdrop, surf_elems, maybe_borders, maybe_glow) in window_batches.iter().rev() {
-        if let Some(backdrop) = maybe_backdrop {
-            draw_render_elements::<GlesRenderer, f64, SolidColorRenderElement>(
-                &mut frame,
-                1.0,
-                std::slice::from_ref(backdrop),
-                &[damage],
-            )?;
-        }
-        draw_render_elements(&mut frame, scale, surf_elems, &[damage])?;
-        if let Some(glow) = maybe_glow {
-            draw_render_elements::<GlesRenderer, f64, SolidColorRenderElement>(
-                &mut frame,
-                1.0,
-                glow,
-                &[damage],
-            )?;
-        }
-        if let Some(borders) = maybe_borders {
-            draw_render_elements::<GlesRenderer, f64, SolidColorRenderElement>(
-                &mut frame,
-                1.0,
-                borders,
-                &[damage],
-            )?;
+    {
+        let font = state.bar.font();
+        if let Some(help) = state
+            .help
+            .render_element(renderer, font, physical_size, scale)
+        {
+            elements.push(help.into());
         }
     }
 
-    // Draw the top status bar on top of tiled windows
-    if let Some(ref bar) = bar_elem {
-        draw_render_elements(&mut frame, 1.0, std::slice::from_ref(bar), &[damage])?;
+    let bar_visible = state.bar_visible();
+    {
+        let font = state.bar.font();
+        if let Some(notifications) = state.notifications.render_element(
+            renderer,
+            font,
+            state.output_size.w,
+            bar_visible,
+            scale,
+        ) {
+            elements.push(notifications.into());
+        }
     }
 
-    // Menus / dropdowns above windows and the bar
-    draw_render_elements(&mut frame, scale, &popup_elems, &[damage])?;
-
-    // Draw layer-shell overlays (such as Spotlight) centered on top of everything
-    for (layer_elems, border, glow) in &layer_batches {
-        draw_render_elements(&mut frame, scale, layer_elems, &[damage])?;
-        draw_render_elements::<GlesRenderer, f64, SolidColorRenderElement>(
-            &mut frame,
-            1.0,
-            glow,
-            &[damage],
-        )?;
-        draw_render_elements::<GlesRenderer, f64, SolidColorRenderElement>(
-            &mut frame,
-            1.0,
-            border,
-            &[damage],
-        )?;
+    for layer in state.layer_surfaces.iter().rev() {
+        if !layer.surface.alive()
+            || !layer.is_above_windows()
+            || layer.namespace == "Spotlight-keepalive"
+        {
+            continue;
+        }
+        let loc = layer.geo.loc.to_physical_precise_round(scale);
+        let surfaces = surface_elements(
+            renderer,
+            layer.surface.wl_surface(),
+            loc,
+            scale,
+            OPACITY_ACTIVE,
+            Kind::Unspecified,
+        );
+        if surfaces.is_empty() {
+            continue;
+        }
+        elements.extend(
+            border_rects_for_window(
+                &layer.border_render_id,
+                CommitCounter::default(),
+                layer.geo,
+                BORDER_WIDTH,
+                COLOR_BORDER_ACTIVE,
+                scale,
+            )
+            .into_iter()
+            .map(PurpRenderElement::from),
+        );
+        elements.extend(
+            outer_glow_rects_for_window(&layer.glow_render_id, layer.geo, scale)
+                .into_iter()
+                .map(PurpRenderElement::from),
+        );
+        elements.extend(surfaces.into_iter().map(PurpRenderElement::from));
     }
 
-    // Draw desktop notification toasts
-    if let Some(ref notif) = notif_elem {
-        draw_render_elements(&mut frame, 1.0, std::slice::from_ref(notif), &[damage])?;
+    for (popup, loc) in state.visible_popups() {
+        elements.extend(
+            surface_elements(
+                renderer,
+                popup.wl_surface(),
+                loc.to_physical_precise_round(scale),
+                scale,
+                1.0,
+                Kind::Unspecified,
+            )
+            .into_iter()
+            .map(PurpRenderElement::from),
+        );
     }
 
-    // Draw the `Mod + h` keybinding cheat sheet overlay
-    if let Some(ref help) = help_elem {
-        draw_render_elements(&mut frame, 1.0, std::slice::from_ref(help), &[damage])?;
+    if bar_visible {
+        let occupied_tags = state
+            .windows
+            .iter()
+            .filter(|w| !w.is_scratchpad)
+            .fold(0u16, |acc, w| acc | w.tags);
+        let urgent_tags = state
+            .windows
+            .iter()
+            .filter(|w| w.is_urgent)
+            .fold(0u16, |acc, w| acc | w.tags);
+        let focused_tags = state
+            .focused_idx
+            .and_then(|idx| state.windows.get(idx))
+            .map(|w| w.tags)
+            .unwrap_or(0);
+        let focused_title = state
+            .focused_idx
+            .and_then(|idx| state.windows.get(idx))
+            .filter(|w| w.is_visible_on(state.workspace.selected_tags))
+            .map(|w| {
+                if w.is_scratchpad {
+                    format!("[scratch] {}", w.title())
+                } else if w.opacity_override == Some(1.0) {
+                    format!("[opaque] {}", w.title())
+                } else {
+                    w.title()
+                }
+            })
+            .unwrap_or_else(|| {
+                String::from(
+                    "purpwm — Mod+h: Help | Tap Mod: Spotlight | Mod+Enter: Term | Mod+w: Wi-Fi | Mod+Shift+b: BT",
+                )
+            });
+        if let Some(bar) = state.bar.render_element(
+            renderer,
+            physical_size.w,
+            state.workspace.selected_tags,
+            occupied_tags,
+            focused_tags,
+            urgent_tags,
+            state.workspace.layout(),
+            &focused_title,
+        ) {
+            elements.push(bar.into());
+        }
     }
 
-    // Draw drag-and-drop icon under the cursor
-    draw_render_elements(&mut frame, scale, &dnd_elems, &[damage])?;
+    let focused_idx = state.focused_idx;
+    for idx in state.stacking_order() {
+        let w = &mut state.windows[idx];
+        let is_focused = focused_idx == Some(idx);
+        let alpha = if w.is_fullscreen {
+            1.0
+        } else {
+            w.opacity_override.unwrap_or(if is_focused {
+                OPACITY_ACTIVE
+            } else {
+                OPACITY_INACTIVE
+            })
+        };
+        let loc = w.surface_loc().to_physical_precise_round(scale);
+        let clip: Rectangle<i32, Physical> =
+            Rectangle::new(w.content_loc(), w.surface_size()).to_physical_precise_round(scale);
 
-    // Draw the cursor on top of all surfaces
-    draw_render_elements(&mut frame, scale, &cursor_surface_elems, &[damage])?;
-    if let Some(ref cur) = cursor_theme_elem {
-        // Theme cursors are sized in physical pixels already.
-        draw_render_elements(&mut frame, 1.0, std::slice::from_ref(cur), &[damage])?;
-    }
-    if let Some(ref cur) = cursor_fallback_elem {
-        // The built-in bitmap is in logical pixels, so it grows with the scale.
-        draw_render_elements(&mut frame, scale, std::slice::from_ref(cur), &[damage])?;
+        if !w.is_fullscreen && BORDER_WIDTH > 0 {
+            let color = if is_focused {
+                COLOR_BORDER_ACTIVE
+            } else {
+                COLOR_BORDER_INACTIVE
+            };
+            if w.border_color != Some(color) {
+                w.border_color = Some(color);
+                w.border_commit.increment();
+            }
+            elements.extend(
+                border_rects_for_window(
+                    &w.border_render_id,
+                    w.border_commit,
+                    w.geo,
+                    BORDER_WIDTH,
+                    color,
+                    scale,
+                )
+                .into_iter()
+                .map(PurpRenderElement::from),
+            );
+            if is_focused {
+                elements.extend(
+                    outer_glow_rects_for_window(&w.glow_render_id, w.geo, scale)
+                        .into_iter()
+                        .map(PurpRenderElement::from),
+                );
+            }
+        }
+
+        elements.extend(
+            surface_elements(
+                renderer,
+                w.wl_surface(),
+                loc,
+                scale,
+                alpha,
+                Kind::Unspecified,
+            )
+            .into_iter()
+            .filter_map(|elem| CropRenderElement::from_element(elem, scale, clip))
+            .map(PurpRenderElement::from),
+        );
+
+        if w.is_fullscreen {
+            elements.push(
+                SolidColorRenderElement::new(
+                    w.backdrop_render_id.clone(),
+                    clip,
+                    CommitCounter::default(),
+                    Color32F::new(0.0, 0.0, 0.0, 1.0),
+                    Kind::Unspecified,
+                )
+                .into(),
+            );
+        }
     }
 
-    let _ = frame.finish()?;
-    Ok(())
+    for layer in &state.layer_surfaces {
+        if !layer.surface.alive()
+            || layer.is_above_windows()
+            || layer.namespace == "Spotlight-keepalive"
+        {
+            continue;
+        }
+        elements.extend(
+            surface_elements(
+                renderer,
+                layer.surface.wl_surface(),
+                layer.geo.loc.to_physical_precise_round(scale),
+                scale,
+                1.0,
+                Kind::Unspecified,
+            )
+            .into_iter()
+            .map(PurpRenderElement::from),
+        );
+    }
+
+    if let Some(wallpaper) =
+        state
+            .wallpaper
+            .render_element(renderer, physical_size.w, physical_size.h)
+    {
+        elements.push(wallpaper.into());
+    }
+
+    let result = tracker.render_output(renderer, framebuffer, age, &elements, COLOR_BG_ROOT)?;
+    Ok(result.damage.cloned())
 }

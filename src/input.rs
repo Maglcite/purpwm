@@ -622,6 +622,11 @@ impl PurpState {
             self.touch_grab_slot = None;
             return true;
         };
+        if w.is_fullscreen {
+            self.active_grab = None;
+            self.touch_grab_slot = None;
+            return true;
+        }
         let dx = (position.x - start_pointer.x).round() as i32;
         let dy = (position.y - start_pointer.y).round() as i32;
         if let Some(edges) = edges {
@@ -638,8 +643,12 @@ impl PurpState {
             }
             w.float_geo.size = clamped;
         } else {
-            w.float_geo.loc.x = start_geo.loc.x + dx;
-            w.float_geo.loc.y = start_geo.loc.y + dy;
+            w.float_geo.loc = crate::state::clamp_floating_loc(
+                start_geo.loc + Point::from((dx, dy)),
+                start_geo.size,
+                self.output_size,
+                self.workspace.show_bar,
+            );
         }
         w.geo = w.float_geo;
         self.relayout();
@@ -757,6 +766,7 @@ impl PurpState {
         if self.layer_surface_at(position).is_none()
             && !self.pointer.is_grabbed()
             && !self.popup_at(position)
+            && !(self.bar_visible() && position.y >= 0.0 && position.y < BAR_HEIGHT as f64)
         {
             let hovered = self.window_at(position).map(|(idx, _)| idx);
             let hovered_surface = hovered.map(|idx| self.windows[idx].wl_surface().clone());
@@ -969,13 +979,10 @@ impl PurpState {
                         return;
                     }
                 }
-                let w = &mut self.windows[idx];
-                if !w.is_floating && !w.is_scratchpad {
-                    w.is_floating = true;
-                    w.float_geo = w.geo;
-                }
-                let start_geo = w.float_geo;
-                let surface = w.wl_surface().clone();
+                let Some(start_geo) = self.floating_grab_geometry(idx) else {
+                    return;
+                };
+                let surface = self.windows[idx].wl_surface().clone();
                 if button == BTN_LEFT {
                     self.touch_grab_slot = None;
                     self.active_grab = Some(InteractiveGrab::Move {
@@ -1132,13 +1139,10 @@ impl PurpState {
         if is_mod_active(&self.modifiers) {
             if let Some((idx, _)) = self.window_at(pos) {
                 self.focused_idx = Some(idx);
-                let w = &mut self.windows[idx];
-                if !w.is_floating && !w.is_scratchpad {
-                    w.is_floating = true;
-                    w.float_geo = w.geo;
-                }
-                let start_geo = w.float_geo;
-                let surface = w.wl_surface().clone();
+                let Some(start_geo) = self.floating_grab_geometry(idx) else {
+                    return;
+                };
+                let surface = self.windows[idx].wl_surface().clone();
                 self.touch_grab_slot = Some(slot);
                 self.active_grab = Some(InteractiveGrab::Move {
                     surface,
