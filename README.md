@@ -7,6 +7,7 @@ A small, `dwm`-inspired dynamic tiling **Wayland compositor** written in Rust on
 - **5 layouts**: Tile `[]=`, Centered Master `|M|`, Grid `###`, Monocle `[M]`, Floating `><>`.
 - **Translucent purple look**: glass-like window opacity, glowing focus borders, built-in status bar, system XCursor theme with purple fallback, and `Mod + h` keybinding cheat sheet overlay.
 - **HiDPI**: sharp fractional scaling (default `1.5x`), adjustable live.
+- **Low resource use**: damage-tracked rendering redraws only what changed, the bar / notifications / glyph caches are reused across frames, and frame callbacks go only to visible surfaces.
 - **Native touch support**: full `wl_touch` forwarding, tap-to-focus windows, status-bar touch controls, and `Mod + Touch` window dragging.
 - **Built-in PAM lock screen**: `Mod + Shift + l` (or `Mod + Ctrl + l` / `kill -USR2`) locks the session with a full-screen purple PAM locker.
 - **Built-in notifications**: implements `org.freedesktop.Notifications` on D-Bus and renders translucent purple toast cards (click or tap to dismiss).
