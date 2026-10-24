@@ -782,6 +782,7 @@ impl PurpState {
         }
 
         let under = self.surface_under(position);
+        self.pointer_focus_origin = under.as_ref().map(|(_, loc)| *loc);
         let pointer = self.pointer.clone();
         pointer.motion(
             self,

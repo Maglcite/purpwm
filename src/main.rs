@@ -31,6 +31,8 @@ use std::{
 use smithay::{
     backend::{
         allocator::Fourcc,
+        drm::DrmNode,
+        egl::EGLDevice,
         input::{
             AbsolutePositionEvent, ButtonState, Event, InputEvent, KeyboardKeyEvent,
             PointerButtonEvent, PointerMotionEvent, TouchEvent,
@@ -38,7 +40,7 @@ use smithay::{
         renderer::{
             damage::OutputDamageTracker,
             gles::{GlesError, GlesMapping, GlesRenderer, GlesTarget},
-            ExportMem, Texture,
+            ExportMem, ImportDma, Texture,
         },
         winit::{self, WinitEvent, WinitInput},
     },
@@ -53,6 +55,7 @@ use smithay::{
         },
     },
     utils::{Buffer, IsAlive, Logical, Physical, Rectangle, Size, Transform},
+    wayland::dmabuf::DmabufFeedbackBuilder,
 };
 
 use crate::{
@@ -331,7 +334,24 @@ pub fn run_winit(
     output.set_preferred(mode);
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
-    let mut state = PurpState::new(dh, socket_name.clone(), initial_logical, !is_standalone);
+    let mut state = PurpState::new(dh.clone(), socket_name.clone(), initial_logical, !is_standalone);
+    let dmabuf_formats = backend.renderer().dmabuf_formats();
+    let render_node = EGLDevice::device_for_display(backend.renderer().egl_context().display())
+        .ok()
+        .and_then(|dev| dev.try_get_render_node().ok().flatten())
+        .or_else(|| DrmNode::from_path("/dev/dri/renderD128").ok());
+    let _dmabuf_global = match render_node.and_then(|node| {
+        DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.clone())
+            .build()
+            .ok()
+    }) {
+        Some(default_feedback) => state
+            .dmabuf_state
+            .create_global_with_default_feedback::<PurpState>(&dh, &default_feedback),
+        None => state
+            .dmabuf_state
+            .create_global::<PurpState>(&dh, dmabuf_formats),
+    };
     state.set_scale(scale);
     state.output = Some(output.clone());
     let capture_path = state
@@ -499,6 +519,7 @@ pub fn run_winit(
             let phys_size = backend.window_size();
             if phys_size.w > 0 && phys_size.h > 0 && (phys_size, state.scale) != applied_output {
                 applied_output = (phys_size, state.scale);
+                buffer_age = 0;
                 let mode = Mode {
                     size: phys_size,
                     refresh: 120_000,
@@ -550,48 +571,52 @@ pub fn run_winit(
                 damage
             };
 
-            if let Some(damage) = damage {
-                // Only visible surfaces get frame callbacks, so clients on hidden tags (or while
-                // the session is locked) stop redrawing until they are shown again.
-                if !state.is_locked() {
-                    let elapsed_ms = start_time.elapsed().as_millis() as u32;
-                    let tags = state.workspace.selected_tags;
-                    for win in state.windows.iter().filter(|w| w.is_visible_on(tags)) {
-                        send_frames_surface_tree(win.wl_surface(), elapsed_ms);
-                    }
-                    for (popup, _) in state.visible_popups() {
-                        send_frames_surface_tree(popup.wl_surface(), elapsed_ms);
-                    }
-                    if let CursorImageStatus::Surface(ref cursor) = state.cursor_status {
-                        send_frames_surface_tree(cursor, elapsed_ms);
-                    }
-                    for layer in &state.layer_surfaces {
-                        if layer.surface.alive()
-                            && layer.is_mapped()
-                            && layer.namespace != "Spotlight-keepalive"
-                        {
-                            send_frames_surface_tree(layer.surface.wl_surface(), elapsed_ms);
-                        }
-                    }
-                    if let Some(ref icon) = state.dnd_icon {
-                        if icon.alive() {
-                            send_frames_surface_tree(icon, elapsed_ms);
-                        }
-                    }
-                }
-
-                backend.submit(Some(&damage))?;
+            if let Some(ref damage) = damage {
+                backend.submit(Some(damage))?;
                 buffer_age = backend.buffer_age().unwrap_or(0);
             }
+
+            // Visible surfaces always get frame callbacks (even when `damage` is `None`, e.g.
+            // when a client commits a bufferless `wl_surface.frame` to arm its VSync clock),
+            // while hidden tags and locked sessions stay throttled.
+            if !state.is_locked() {
+                let elapsed_ms = start_time.elapsed().as_millis() as u32;
+                let tags = state.workspace.selected_tags;
+                for win in state.windows.iter().filter(|w| w.is_visible_on(tags)) {
+                    send_frames_surface_tree(win.wl_surface(), elapsed_ms);
+                }
+                for (popup, _) in state.visible_popups() {
+                    send_frames_surface_tree(popup.wl_surface(), elapsed_ms);
+                }
+                if let CursorImageStatus::Surface(ref cursor) = state.cursor_status {
+                    send_frames_surface_tree(cursor, elapsed_ms);
+                }
+                for layer in &state.layer_surfaces {
+                    if layer.surface.alive()
+                        && layer.is_mapped()
+                        && layer.namespace != "Spotlight-keepalive"
+                    {
+                        send_frames_surface_tree(layer.surface.wl_surface(), elapsed_ms);
+                    }
+                }
+                if let Some(ref icon) = state.dnd_icon {
+                    if icon.alive() {
+                        send_frames_surface_tree(icon, elapsed_ms);
+                    }
+                }
+            }
+            display.flush_clients()?;
             needs_render = false;
 
             if let Some(mapping) = pending_capture.take() {
+                buffer_age = 0;
                 match finish_capture(backend.renderer(), &mapping) {
                     Ok((w, h, rgba)) => state.save_screenshot(w, h, rgba),
                     Err(err) => tracing::warn!("Screenshot capture failed: {}", err),
                 }
             }
             if let Some(mapping) = pending_portal_capture {
+                buffer_age = 0;
                 let result = if state.is_locked() {
                     Err("session is locked".to_owned())
                 } else {
@@ -601,6 +626,10 @@ pub fn run_winit(
                     })
                 };
                 capture::deliver(portal_replies, result);
+            }
+
+            if damage.is_none() && !capture_pending {
+                std::thread::sleep(std::time::Duration::from_millis(8));
             }
         } else {
             // Idle throttling: sleep 8ms (~120Hz polling) when nothing changed,

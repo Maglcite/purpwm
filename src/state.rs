@@ -15,6 +15,7 @@ use std::{
 
 use smithay::{
     backend::{
+        allocator::dmabuf::Dmabuf,
         input::{Keycode, TouchSlot},
         renderer::{
             element::Id,
@@ -22,9 +23,10 @@ use smithay::{
         },
     },
     delegate_compositor, delegate_cursor_shape, delegate_data_control, delegate_data_device,
-    delegate_fractional_scale, delegate_idle_inhibit, delegate_layer_shell, delegate_output,
-    delegate_primary_selection, delegate_seat, delegate_shm, delegate_single_pixel_buffer,
-    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_dmabuf, delegate_fractional_scale, delegate_idle_inhibit, delegate_layer_shell,
+    delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
+    delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_activation,
+    delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         find_popup_root_surface, get_popup_toplevel_coords, utils::under_from_surface_tree,
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy,
@@ -62,6 +64,7 @@ use smithay::{
             CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
         },
         cursor_shape::CursorShapeManagerState,
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         fractional_scale::{
             with_fractional_scale, FractionalScaleHandler, FractionalScaleManagerState,
         },
@@ -405,6 +408,7 @@ pub struct PurpState {
     pub xdg_activation_state: XdgActivationState,
     pub layer_shell_state: WlrLayerShellState,
     pub shm_state: ShmState,
+    pub dmabuf_state: DmabufState,
     pub seat_state: SeatState<Self>,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
@@ -423,6 +427,7 @@ pub struct PurpState {
     pub pointer: PointerHandle<Self>,
     pub touch: TouchHandle<Self>,
     pub pointer_location: Point<f64, Logical>,
+    pub pointer_focus_origin: Option<Point<f64, Logical>>,
     pub touch_locations: HashMap<TouchSlot, Point<f64, Logical>>,
     pub touch_grab_slot: Option<TouchSlot>,
     pub cursor_status: CursorImageStatus,
@@ -506,6 +511,7 @@ impl PurpState {
         let xdg_activation_state = XdgActivationState::new::<Self>(&display_handle);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&display_handle);
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
+        let dmabuf_state = DmabufState::new();
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
@@ -550,6 +556,7 @@ impl PurpState {
             xdg_activation_state,
             layer_shell_state,
             shm_state,
+            dmabuf_state,
             seat_state,
             data_device_state,
             primary_selection_state,
@@ -566,6 +573,7 @@ impl PurpState {
             pointer,
             touch,
             pointer_location: Point::from((output_size.w as f64 / 2.0, output_size.h as f64 / 2.0)),
+            pointer_focus_origin: None,
             touch_locations: HashMap::new(),
             touch_grab_slot: None,
             cursor_status: CursorImageStatus::default_named(),
@@ -626,6 +634,7 @@ impl PurpState {
         let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
 
+        self.pointer_focus_origin = None;
         let pointer = self.pointer.clone();
         pointer.motion(
             self,
@@ -807,6 +816,16 @@ impl PurpState {
         } else {
             self.surface_under(self.pointer_location)
         };
+        let target_surface = under.as_ref().map(|(s, _)| s);
+        let target_origin = under.as_ref().map(|(_, loc)| *loc);
+        if !self.pointer.is_grabbed()
+            && self.pointer.current_location() == self.pointer_location
+            && self.pointer.current_focus().as_ref() == target_surface
+            && self.pointer_focus_origin == target_origin
+        {
+            return;
+        }
+        self.pointer_focus_origin = target_origin;
         let pointer = self.pointer.clone();
         pointer.motion(
             self,
@@ -2168,6 +2187,21 @@ impl ShmHandler for PurpState {
     }
 }
 
+impl DmabufHandler for PurpState {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        _dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        let _ = notifier.successful::<Self>();
+    }
+}
+
 impl SeatHandler for PurpState {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
@@ -2552,6 +2586,7 @@ fn resize_edges_from_request(edge: xdg_toplevel::ResizeEdge) -> ResizeEdges {
 
 delegate_compositor!(PurpState);
 delegate_shm!(PurpState);
+delegate_dmabuf!(PurpState);
 delegate_seat!(PurpState);
 delegate_data_device!(PurpState);
 delegate_primary_selection!(PurpState);

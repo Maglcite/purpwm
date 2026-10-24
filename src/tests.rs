@@ -705,4 +705,26 @@ mod tests {
         assert!(nc.tick());
         assert!(nc.is_empty());
     }
+
+    #[test]
+    fn test_sync_pointer_focus_skips_unchanged_target() {
+        let display: Display<PurpState> = Display::new().unwrap();
+        let mut state = PurpState::new(
+            display.handle(),
+            "wayland-test".to_string(),
+            Size::from((1600, 1000)),
+            true,
+        );
+        // First sync updates `self.pointer`'s location from `(0, 0)` to `pointer_location`.
+        state.sync_pointer_focus(0);
+        assert_eq!(state.pointer.current_location(), state.pointer_location);
+
+        // A second sync with unchanged pointer location and unchanged target must be a no-op
+        // (even if `pointer_focus_origin` is checked), whereas changing `pointer_location`
+        // updates the pointer handle's location.
+        state.sync_pointer_focus(0);
+        state.pointer_location = Point::from((250.0, 300.0));
+        state.sync_pointer_focus(0);
+        assert_eq!(state.pointer.current_location(), Point::from((250.0, 300.0)));
+    }
 }
