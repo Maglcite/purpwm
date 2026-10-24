@@ -10,7 +10,7 @@ use smithay::{
             memory::MemoryRenderBufferRenderElement,
             solid::SolidColorRenderElement,
             surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
-            utils::CropRenderElement,
+            utils::{CropRenderElement, RescaleRenderElement},
             Id, Kind,
         },
         gles::{GlesError, GlesRenderer, GlesTarget},
@@ -36,6 +36,15 @@ smithay::backend::renderer::element::render_elements! {
     Surface=WaylandSurfaceRenderElement<GlesRenderer>,
     Crop=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
     Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
+    PhysicalMemory=RescaleRenderElement<MemoryRenderBufferRenderElement<GlesRenderer>>,
+}
+
+pub(crate) fn physical_memory_element<E: smithay::backend::renderer::element::Element>(
+    element: E,
+    scale: f64,
+) -> RescaleRenderElement<E> {
+    let origin = element.geometry(scale.into()).loc;
+    RescaleRenderElement::from_element(element, origin, 1.0 / scale)
 }
 
 fn surface_elements(
@@ -114,7 +123,7 @@ pub fn render_output_frame(
         let elements: Vec<PurpRenderElement> = lock
             .render_element(renderer, font, physical_size, scale)
             .into_iter()
-            .map(PurpRenderElement::from)
+            .map(|element| physical_memory_element(element, scale).into())
             .collect();
         let result = tracker.render_output(renderer, framebuffer, age, &elements, COLOR_BG_ROOT)?;
         return Ok(result.damage.cloned());
@@ -151,7 +160,7 @@ pub fn render_output_frame(
                     .cursor_theme
                     .render_element(renderer, icon, cpos, scale)
                 {
-                    elements.push(cursor.into());
+                    elements.push(physical_memory_element(cursor, scale).into());
                 } else if let Some(cursor) = state.bar.cursor_render_element(renderer, cpos) {
                     elements.push(cursor.into());
                 }
@@ -174,7 +183,7 @@ pub fn render_output_frame(
             .help
             .render_element(renderer, font, physical_size, scale)
         {
-            elements.push(help.into());
+            elements.push(physical_memory_element(help, scale).into());
         }
     }
 
@@ -188,7 +197,7 @@ pub fn render_output_frame(
             bar_visible,
             scale,
         ) {
-            elements.push(notifications.into());
+            elements.push(physical_memory_element(notifications, scale).into());
         }
     }
 
@@ -290,7 +299,7 @@ pub fn render_output_frame(
             state.workspace.layout(),
             &focused_title,
         ) {
-            elements.push(bar.into());
+            elements.push(physical_memory_element(bar, scale).into());
         }
     }
 
@@ -396,7 +405,7 @@ pub fn render_output_frame(
             .wallpaper
             .render_element(renderer, physical_size.w, physical_size.h)
     {
-        elements.push(wallpaper.into());
+        elements.push(physical_memory_element(wallpaper, scale).into());
     }
 
     let result = tracker.render_output(renderer, framebuffer, age, &elements, COLOR_BG_ROOT)?;

@@ -3,10 +3,16 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use smithay::{
-        backend::input::Keycode,
+        backend::{
+            input::Keycode,
+            renderer::{
+                element::{Element, Id},
+                utils::CommitCounter,
+            },
+        },
         input::keyboard::{keysyms, Keysym, ModifiersState},
         reexports::wayland_server::Display,
-        utils::{Logical, Physical, Point, Rectangle, Size},
+        utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size},
     };
 
     use crate::{
@@ -20,6 +26,7 @@ mod tests {
         input::{keysym_to_lock_key, KeyAction},
         lock::{pam_check, LockKey, LockPoll, LockScreen, CONVERSATIONS},
         notify::{parse_dbus_line, parse_dbus_notification_line, DbusLine, NotificationCenter},
+        render::physical_memory_element,
         state::{
             clamp_floating_geo, clamp_floating_loc, focus_after_zoom, resize_rect,
             touch_physical_to_logical_coords, wifi_needs_autoconnect, PurpState, ResizeEdges,
@@ -380,6 +387,49 @@ mod tests {
         let font = bar.font().expect("status bar must always have a font");
         let (metrics, bitmap) = font.rasterize('1', 16.0);
         assert!(metrics.width > 0 && bitmap.iter().any(|&a| a > 0));
+    }
+
+    #[test]
+    fn test_physical_memory_element_does_not_scale_twice() {
+        struct ScaledElement {
+            id: Id,
+            loc: Point<i32, Physical>,
+            size: Size<i32, Logical>,
+        }
+
+        impl Element for ScaledElement {
+            fn id(&self) -> &Id {
+                &self.id
+            }
+
+            fn current_commit(&self) -> CommitCounter {
+                CommitCounter::default()
+            }
+
+            fn src(&self) -> Rectangle<f64, Buffer> {
+                Rectangle::from_size(Size::from((self.size.w as f64, self.size.h as f64)))
+            }
+
+            fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+                Rectangle::new(
+                    self.loc,
+                    self.size.to_f64().to_physical(scale).to_i32_round(),
+                )
+            }
+        }
+
+        let element = ScaledElement {
+            id: Id::new(),
+            loc: Point::from((240, 30)),
+            size: Size::from((1920, 42)),
+        };
+        let element = physical_memory_element(element, 1.5);
+
+        assert_eq!(
+            element.geometry(Scale::from(1.5)),
+            Rectangle::new(Point::from((240, 30)), Size::from((1920, 42)))
+        );
+        assert_eq!(element.src().size, Size::from((1920.0, 42.0)));
     }
 
     #[test]
