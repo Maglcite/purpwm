@@ -58,6 +58,9 @@ export _JAVA_AWT_WM_NONREPARENTING=1
 # Wayland compositors lacking linux-dmabuf (such as nested Gamescope / purpwm) fail Vulkan WSI
 # with VK_ERROR_SURFACE_LOST_KHR after a ~500ms timeout stall. Setting WGPU_BACKEND=gl eliminates this.
 export WGPU_BACKEND=gl
+# Gamescope's Wayland EGL WSI falls back to llvmpipe and can saturate the CPU in
+# browsers. Surfaceless EGL uses the real GPU while presentation stays on Wayland.
+export EGL_PLATFORM="${EGL_PLATFORM:-surfaceless}"
 
 # Initialize the daemon started by login PAM; --start alone does not unlock it.
 if [ "$AUTOSTART" != 0 ] && command -v gnome-keyring-daemon >/dev/null 2>&1; then
@@ -78,7 +81,7 @@ fi
 
 # Import environment into systemd user session
 if [ "$AUTOSTART" != 0 ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl --user import-environment XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DBUS_SESSION_BUS_ADDRESS GNOME_KEYRING_CONTROL SSH_AUTH_SOCK PATH WGPU_BACKEND 2>/dev/null || true
+    systemctl --user import-environment XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP DBUS_SESSION_BUS_ADDRESS GNOME_KEYRING_CONTROL SSH_AUTH_SOCK PATH WGPU_BACKEND EGL_PLATFORM 2>/dev/null || true
 fi
 
 # Ensure Wi-Fi and Bluetooth are active on session login.
